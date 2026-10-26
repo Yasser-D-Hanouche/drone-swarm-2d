@@ -1,0 +1,11 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+runs/
+logs/
+*.zip
+*.gif
+*.png
+*.csv
+.DS_Store
