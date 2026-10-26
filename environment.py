@@ -6,6 +6,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 
+SUCCESS_RADIUS = 0.5
 WORLD_SIZE = 10.0
 NUM_DRONES = 3
 DRONE_RADIUS = 0.15
@@ -68,8 +69,18 @@ class DroneSwarm2D(gym.Env):
         progress = np.mean(old_dist - distances)
 
         center = self.positions.mean(axis=0)
+        pairwise_distances = np.linalg.norm(
+            self.positions[:, None, :] - self.positions[None, :, :],
+            axis=2,
+        )
+
+        # Exclude each drone's distance to itself.
+        np.fill_diagonal(pairwise_distances, np.inf)
+
+        nearest_distances = np.min(pairwise_distances, axis=1)
+
         formation_error = np.mean(
-            np.linalg.norm((self.positions - center) - FORMATION, axis=1)
+            np.maximum(nearest_distances - 0.5, 0.0)
         )
 
         boundary_collision = np.any(
@@ -92,15 +103,15 @@ class DroneSwarm2D(gym.Env):
             for j in range(i + 1, NUM_DRONES)
         )
 
-        center_distance = np.linalg.norm(center - TARGET)
-        success = bool(center_distance < 0.5)
+        distances = np.linalg.norm(self.positions - TARGET, axis=1)
+        success = bool(np.all(distances < SUCCESS_RADIUS))
         collision = bool(
             boundary_collision or obstacle_collision or pair_collision
         )
 
         reward = (
             5.0 * progress
-            - 0.1 * formation_error
+            - 1 * formation_error
             - 0.01
         )
 
