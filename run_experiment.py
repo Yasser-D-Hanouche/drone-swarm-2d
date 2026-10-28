@@ -1,326 +1,171 @@
+"""Train, evaluate against baselines, diagnose failures and write a report for one experiment.
+
+Examples:
+  python run_experiment.py --list-params
+  python run_experiment.py --name stronger_crash --set reward.collision_penalty=30 --hypothesis "less obstacle hits"
+  python run_experiment.py --name jitter --set env.start_jitter=0.3 reward.obstacle_margin=0.8 reward.obstacle_weight=1
+"""
 import argparse
 import csv
 import json
 import shutil
 import subprocess
 import sys
-from contextlib import redirect_stdout, redirect_stderr
 from datetime import datetime
 from pathlib import Path
-import numpy as np
-import matplotlib
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation, PillowWriter
-from stable_baselines3 import PPO
-from stable_baselines3.common.monitor import Monitor
-from environment import DroneSwarm2D, NUM_DRONES, OBSTACLES
-
-WORLD_SIZE = 10.0
-TARGET = np.array([8.5, 8.5], dtype=float)
-MAX_EPISODE_STEPS = 500
-
-LEARNING_RATE = 3e-4
-N_STEPS = 1024
-BATCH_SIZE = 64
-GAMMA = 0.99
+import config as cfgmod
+from diagnostics import (
+    diagnose, greedy_policy, plot_reward_breakdown, plot_trajectories, plot_training,
+    ppo_policy, random_policy, run_episodes, save_gif, strip_traj, summarize, write_report,
+)
+from training import train
 
 
 def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as file:
-        json.dump(data, file, indent=2)
+    path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
 
 
-def get_git_commit():
+def save_csv(path, rows):
+    if not rows:
+        return
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def git_commit():
     try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        ).strip()
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
 
 
-def create_run_directory(name):
-    timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
-    safe_name = "".join(
-        character if character.isalnum() or character in "-_" else "_"
-        for character in name
-    )
-    run_dir = Path("runs") / f"{timestamp}_{safe_name}"
+def make_run_dir(name):
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+    run_dir = Path("runs") / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe}"
     run_dir.mkdir(parents=True, exist_ok=False)
     return run_dir
 
 
-def train_model(run_dir, timesteps, seed):
-    env = DroneSwarm2D()
-    monitored_env = Monitor(env, filename=str(run_dir / "monitor.csv"))
-    model = PPO(
-        "MlpPolicy",
-        monitored_env,
-        learning_rate=LEARNING_RATE,
-        n_steps=N_STEPS,
-        batch_size=BATCH_SIZE,
-        gamma=GAMMA,
-        verbose=1,
-        seed=seed,
-        tensorboard_log=str(run_dir / "tensorboard"),
-    )
-    
-    with open(run_dir / "training_log.txt", "w", encoding="utf-8") as log_file:
-        with redirect_stdout(log_file), redirect_stderr(log_file):
-            model.learn(total_timesteps=timesteps)
-            
-    model.save(str(run_dir / "model"))
-    monitored_env.close()
-    return model
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--name", help="short experiment name (run.name)")
+    p.add_argument("--hypothesis", help="what you expect this run to show (run.hypothesis)")
+    p.add_argument("--timesteps", type=int, help="PPO timesteps (run.timesteps)")
+    p.add_argument("--episodes", type=int, help="final evaluation episodes (run.eval_episodes)")
+    p.add_argument("--seed", type=int, help="training seed (run.seed)")
+    p.add_argument("--config", help="JSON file with a (partial) config; applied before --set")
+    p.add_argument("--set", nargs="+", action="extend", default=[], metavar="SECTION.NAME=VALUE",
+                   help="override any parameter, e.g. reward.collision_penalty=20")
+    p.add_argument("--no-gif", action="store_true", help="skip GIF generation")
+    p.add_argument("--list-params", action="store_true", help="print every tunable parameter and exit")
+    return p.parse_args()
 
 
-def evaluate_model(model, run_dir, episodes, seed):
-    env = DroneSwarm2D()
-    rows = []
-
-    for episode in range(episodes):
-        episode_seed = seed + episode
-        obs, info = env.reset(seed=episode_seed)
-
-        total_reward = 0.0
-        terminated = False
-        truncated = False
-        steps = 0
-        success = False
-        collision = False
-
-        for steps in range(1, MAX_EPISODE_STEPS + 1):
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = env.step(action)
-            total_reward += float(reward)
-
-            if info.get("success", False):
-                success = True
-            if info.get("collision", False):
-                collision = True
-
-            if terminated or truncated:
-                break
-
-        positions = np.asarray(env.positions)
-        distances = np.linalg.norm(positions - TARGET, axis=1)
-
-        rows.append({
-            "episode": episode + 1,
-            "seed": episode_seed,
-            "success": success,
-            "collision": collision,
-            "reward": total_reward,
-            "steps": steps,
-            "mean_final_target_distance": float(np.mean(distances)),
-        })
-
-        print(
-            f"Episode {episode + 1:02d}/{episodes}: "
-            f"reward={total_reward:.2f}, "
-            f"steps={steps}, "
-            f"success={success}, "
-            f"collision={collision}"
-        )
-
-    env.close()
-
-    metrics_path = run_dir / "episode_metrics.csv"
-    with open(metrics_path, "w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
-
-    summary = {
-        "episodes": episodes,
-        "success_rate": float(np.mean([row["success"] for row in rows])),
-        "collision_rate": float(np.mean([row["collision"] for row in rows])),
-        "mean_reward": float(np.mean([row["reward"] for row in rows])),
-        "mean_episode_length": float(np.mean([row["steps"] for row in rows])),
-        "mean_final_target_distance": float(
-            np.mean([row["mean_final_target_distance"] for row in rows])
-        ),
-    }
-
-    save_json(run_dir / "evaluation.json", summary)
-    return summary
-
-
-def create_animation(model, run_dir, seed=42, max_frames=MAX_EPISODE_STEPS, fps=10):
-    env = DroneSwarm2D()
-    obs, info = env.reset(seed=seed)
-
-    fig, ax = plt.subplots(figsize=(8, 8))
-    ax.set_xlim(0, WORLD_SIZE)
-    ax.set_ylim(0, WORLD_SIZE)
-    ax.set_aspect("equal")
-    ax.set_xlabel("X position")
-    ax.set_ylabel("Y position")
-    ax.grid(True, alpha=0.3)
-
-    ax.scatter(
-        TARGET[0], TARGET[1], marker="*", s=250, color="green", label="Target", zorder=5
-    )
-
-    for ox, oy, radius in OBSTACLES:
-        obstacle = plt.Circle((ox, oy), radius, color="red", alpha=0.5, zorder=2)
-        ax.add_patch(obstacle)
-
-    colors = ["tab:blue", "tab:orange", "tab:purple"]
-    drones = []
-    trails = []
-
-    trail_x = [[] for _ in range(NUM_DRONES)]
-    trail_y = [[] for _ in range(NUM_DRONES)]
-
-    for i in range(NUM_DRONES):
-        drone, = ax.plot(
-            [], [], marker="o", linestyle="None", color=colors[i], markersize=9, label=f"Drone {i + 1}", zorder=4
-        )
-        trail, = ax.plot(
-            [], [], color=colors[i], alpha=0.65, linewidth=1.5, zorder=3
-        )
-        drones.append(drone)
-        trails.append(trail)
-
-    ax.legend(loc="upper left")
-    title = ax.set_title("Trained PPO Drone Swarm")
-
-    state = {
-        "done": False,
-        "steps": 0,
-        "final_message": None,
-    }
-
-    def update(frame):
-        nonlocal obs
-
-        if not state["done"]:
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = env.step(action)
-            state["steps"] += 1
-            state["done"] = terminated or truncated
-
-        positions = np.asarray(env.positions)
-
-        for i, (x, y) in enumerate(positions):
-            drones[i].set_data([x], [y])
-            trail_x[i].append(x)
-            trail_y[i].append(y)
-            trails[i].set_data(trail_x[i], trail_y[i])
-
-        title.set_text(f"Trained PPO Drone Swarm - Step {state['steps']}")
-
-        if state["done"] and state["final_message"] is None:
-            success = info.get("success", False)
-
-            if success:
-                message = "SUCCESS: All drones reached the target"
-                color = "green"
-            else:
-                message = "Episode ended without reaching the target"
-                color = "darkred"
-
-            state["final_message"] = ax.text(
-                0.5, 0.97, message, transform=ax.transAxes, ha="center", va="top",
-                fontsize=10, color=color, fontweight="bold"
-            )
-
-        return drones + trails
-
-    animation = FuncAnimation(
-        fig, update, frames=max_frames, interval=1000 / fps, blit=False, repeat=False
-    )
-    
-    gif_path = run_dir / "swarm.gif"
-    animation.save(str(gif_path), writer=PillowWriter(fps=fps))
-    
-    plt.close(fig)
-    env.close()
-    
-    print(f"Animation saved: {gif_path}")
+def build_config(args):
+    cfg = cfgmod.Config()
+    if args.config:
+        file_cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
+        cfg = cfgmod.from_dict(file_cfg)
+    shortcuts = {"name": args.name, "hypothesis": args.hypothesis, "timesteps": args.timesteps,
+                 "eval_episodes": args.episodes, "seed": args.seed}
+    overrides = [f"run.{k}={json.dumps(v)}" for k, v in shortcuts.items() if v is not None]
+    cfgmod.apply_overrides(cfg, overrides + args.set)
+    if args.no_gif:
+        cfg.run.gif = False
+    cfgmod.validate(cfg)
+    return cfg
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train, evaluate, and record a drone swarm experiment.")
-    parser.add_argument("--name", default="ppo_baseline", help="Short name describing the experiment.")
-    parser.add_argument("--timesteps", type=int, default=50_000, help="Number of PPO training timesteps.")
-    parser.add_argument("--episodes", type=int, default=30, help="Number of evaluation episodes.")
-    parser.add_argument("--seed", type=int, default=42, help="Training and animation random seed.")
-    args = parser.parse_args()
+    args = parse_args()
+    if args.list_params:
+        cfgmod.print_params()
+        return
+    cfg = build_config(args)
+    overrides = cfgmod.diff_from_default(cfg)
 
-    if args.timesteps <= 0 or args.episodes <= 0:
-        parser.error("--timesteps and --episodes must be positive.")
-
-    run_dir = create_run_directory(args.name)
-    git_commit = get_git_commit()
-
-    config = {
-        "experiment_name": args.name,
-        "created_at": datetime.now().astimezone().isoformat(),
-        "algorithm": "PPO",
-        "total_timesteps": args.timesteps,
-        "evaluation_episodes": args.episodes,
-        "seed": args.seed,
-        "learning_rate": LEARNING_RATE,
-        "n_steps": N_STEPS,
-        "batch_size": BATCH_SIZE,
-        "gamma": GAMMA,
-        "target": TARGET.tolist(),
-        "world_size": WORLD_SIZE,
-        "obstacles": [list(obstacle) for obstacle in OBSTACLES],
-        "git_commit": git_commit,
-        "python_version": sys.version,
-    }
-
-    save_json(run_dir / "config.json", config)
-    shutil.copy2("environment.py", run_dir / "environment.py")
-
+    run_dir = make_run_dir(cfg.run.name)
+    commit = git_commit()
+    save_json(run_dir / "config.json", cfg.to_dict())
     save_json(run_dir / "metadata.json", {
-        "status": "running",
-        "started_at": datetime.now().astimezone().isoformat(),
-        "git_commit": git_commit,
+        "status": "running", "started_at": datetime.now().astimezone().isoformat(),
+        "git_commit": commit, "python": sys.version, "command": sys.argv,
     })
+    for source in ("environment.py", "config.py"):
+        shutil.copy2(source, run_dir / source)
 
-    print(f"\nExperiment: {args.name}")
-    print(f"Run directory: {run_dir.resolve()}")
-    print(f"Training timesteps: {args.timesteps}")
-    print(f"Evaluation episodes: {args.episodes}\n")
+    print(f"\nExperiment: {cfg.run.name}  ->  {run_dir.resolve()}")
+    if cfg.run.hypothesis:
+        print(f"Hypothesis: {cfg.run.hypothesis}")
+    changed = {k: v for k, v in overrides.items() if not k.startswith("run.")}
+    print("Changes vs defaults:", json.dumps(changed) if changed else "none")
 
     try:
-        print("1/3 - Training PPO...")
-        model = train_model(run_dir, timesteps=args.timesteps, seed=args.seed)
+        print("\n1/4 Training PPO")
+        model, monitor = train(cfg, run_dir)
+        save_csv(run_dir / "training_episodes.csv", monitor.episodes)
+        save_csv(run_dir / "eval_curve.csv", monitor.eval_curve)
 
-        print("\n2/3 - Evaluating trained policy...")
-        summary = evaluate_model(model, run_dir, episodes=args.episodes, seed=args.seed + 1000)
+        print("\n2/4 Evaluating PPO and baselines on identical seeds")
+        run = cfg.run
+        seed0 = run.seed + 1000
+        policies = {
+            "Random": random_policy,
+            "Greedy": greedy_policy,
+            "PPO": ppo_policy(model),
+        }
+        results = {name: run_episodes(cfg, factory, run.eval_episodes, seed0) for name, factory in policies.items()}
+        summaries = {name: summarize(rows) for name, rows in results.items()}
+        save_csv(run_dir / "episode_metrics_ppo.csv", strip_traj(results["PPO"]))
+        save_csv(run_dir / "episode_metrics_baselines.csv",
+                 [{"policy": n, **r} for n in ("Random", "Greedy") for r in strip_traj(results[n])])
 
-        print("\n3/3 - Generating GIF...")
-        create_animation(model, run_dir, seed=args.seed)
+        print("\n3/4 Diagnosing")
+        diagnosis = diagnose(cfg, summaries, monitor.episodes, monitor.eval_curve)
+        plot_trajectories(results, cfg, run_dir / "trajectories.png")
+        plot_reward_breakdown(summaries["PPO"], run_dir / "reward_breakdown.png")
+        plot_training(monitor.episodes, monitor.eval_curve, run.timesteps, run_dir / "training_curves.png")
 
-        save_json(run_dir / "metadata.json", {
-            "status": "completed",
-            "started_at": config["created_at"],
-            "completed_at": datetime.now().astimezone().isoformat(),
-            "git_commit": git_commit,
+        files = ["report.md", "results.json", "config.json", "trajectories.png", "reward_breakdown.png",
+                 "training_curves.png", "training_episodes.csv", "eval_curve.csv", "episode_metrics_ppo.csv",
+                 "episode_metrics_baselines.csv", "model.zip", "sb3_log/"]
+        if run.gif:
+            print("\n4/4 Recording GIFs")
+            ppo_rows = results["PPO"]
+            save_gif(cfg, ppo_rows[0], run_dir / "episode_first.gif", f"PPO seed {ppo_rows[0]['seed']}")
+            files.append("episode_first.gif")
+            failure = next((r for r in ppo_rows if not r["success"]), None)
+            if failure is not None and failure is not ppo_rows[0]:
+                save_gif(cfg, failure, run_dir / "episode_failure.gif", f"PPO seed {failure['seed']}")
+                files.append("episode_failure.gif")
+
+        save_json(run_dir / "results.json", {
+            "name": run.name, "hypothesis": run.hypothesis, "seed": run.seed, "overrides": overrides,
+            "summaries": summaries, "diagnosis": diagnosis, "eval_curve": monitor.eval_curve,
         })
-
-        print("\nExperiment completed.")
-        print(f"Results directory: {run_dir.resolve()}")
-        print("\nEvaluation summary:")
-        print(json.dumps(summary, indent=2))
-
+        write_report(run_dir / "report.md", cfg, overrides, summaries, diagnosis, monitor.episodes, files)
+        save_json(run_dir / "metadata.json", {
+            "status": "completed", "completed_at": datetime.now().astimezone().isoformat(), "git_commit": commit,
+        })
     except Exception as error:
         save_json(run_dir / "metadata.json", {
-            "status": "failed",
-            "failed_at": datetime.now().astimezone().isoformat(),
-            "error": repr(error),
-            "git_commit": git_commit,
+            "status": "failed", "failed_at": datetime.now().astimezone().isoformat(), "error": repr(error),
+            "git_commit": commit,
         })
         raise
+
+    print("\n" + "=" * 70)
+    for name, s in summaries.items():
+        lo, hi = s["success_ci95"]
+        print(f"{name:<7} success {s['success_rate']:.0%} [{lo:.0%}-{hi:.0%}]  collision {s['collision_rate']:.0%}  "
+              f"timeout {s['outcome_rates']['timeout']:.0%}  return {s['mean_reward']:.1f}")
+    print("\nDiagnosis:")
+    for d in diagnosis:
+        print(f"  - {d['finding']}\n      Try: {d['suggestion']}")
+    print(f"\nFull report: {(run_dir / 'report.md').resolve()}")
 
 
 if __name__ == "__main__":
