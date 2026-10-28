@@ -1,11 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
 .venv/
 venv/
-__pycache__/
-*.pyc
+
+# Experiment outputs and trained models
 runs/
 logs/
-*.zip
-*.gif
-*.png
-*.csv
+tensorboard/
+ppo_drone_swarm.zip
+model.zip
+*.pth
+*.pt
+*.ckpt
+
+# Generated plots and animations
+swarm.png
+swarm.gif
+*.mp4
+
+# Local configuration and temporary files
+.env
+*.tmp
 .DS_Store
