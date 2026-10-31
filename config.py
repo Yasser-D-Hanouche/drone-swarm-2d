@@ -58,6 +58,9 @@ class EnvConfig:
 @dataclass
 class RewardConfig:
     # Per-step terms; the success/collision terms are paid once because the episode ends.
+
+    wall_weight: float = 3.0
+    wall_margin: float = 1.0
     progress_weight: float = 2.0       # + weight * mean decrease in distance to the target per step (only once found)
     explore_weight: float = 0.2        # + weight per map cell searched for the first time (only until the target is found)
     cohesion_weight: float = 0.5       # - weight * mean(max(0, distance to centroid - env.cohesion_radius)) per step
@@ -250,3 +253,7 @@ def validate(cfg: Config) -> None:
             raise ValueError("env.start_center +- (start_spread + start_jitter) leaves the world; move it inward")
     if not e.random_target and not all(lo <= v <= hi for v in e.target):
         raise ValueError("env.target leaves the world")
+    if r.wall_weight > 0 and r.wall_margin <= 0:
+        raise ValueError(
+            "reward.wall_weight needs reward.wall_margin > 0"
+        )

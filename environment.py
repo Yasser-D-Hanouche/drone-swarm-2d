@@ -10,7 +10,17 @@ from matplotlib.patches import Circle, Rectangle
 
 from config import EnvConfig, RewardConfig
 
-REWARD_TERMS = ["progress", "exploration", "cohesion", "separation", "step", "obstacle_proximity", "collision", "success"]
+REWARD_TERMS = [
+    "progress",
+    "exploration",
+    "cohesion",
+    "separation",
+    "step",
+    "obstacle_proximity",
+    "wall_proximity",
+    "collision",
+    "success"
+]
 OUTCOMES = ["success", "obstacle", "boundary", "drone_collision", "timeout"]
 
 
@@ -315,6 +325,14 @@ class DroneSwarm2D(gym.Env):
         if w.obstacle_margin > 0:
             proximity = np.maximum(0.0, w.obstacle_margin - obs_clear) / w.obstacle_margin
             terms["obstacle_proximity"] = -w.obstacle_weight * float(np.mean(proximity))
+        if w.obstacle_margin > 0:
+            proximity = np.maximum(
+                0.0, w.obstacle_margin - obs_clear
+            ) / w.obstacle_margin
+
+            terms["obstacle_proximity"] = (
+                -w.obstacle_weight * float(np.mean(proximity))
+            )
         if collision:
             terms["collision"] = -w.collision_penalty
         if success:
