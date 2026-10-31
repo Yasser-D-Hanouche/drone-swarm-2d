@@ -21,6 +21,7 @@ class EnvConfig:
     dt: float = 0.1                    # seconds per step
     max_speed: float = 1.0
     max_accel: float = 1.0
+    action_residual_scale: float = 1.0
     max_steps: int = 800               # episode time limit (steps); searching needs far more than flying to a known target
     num_drones: int = 3
 
@@ -58,9 +59,13 @@ class EnvConfig:
 @dataclass
 class RewardConfig:
     # Per-step terms; the success/collision terms are paid once because the episode ends.
+
+    wall_weight: float = 3.0
+    wall_margin: float = 1.0
     progress_weight: float = 2.0       # + weight * mean decrease in distance to the target per step (only once found)
     explore_weight: float = 0.2        # + weight per map cell searched for the first time (only until the target is found)
     cohesion_weight: float = 0.5       # - weight * mean(max(0, distance to centroid - env.cohesion_radius)) per step
+    formation_weight: float = 0.5
     separation_weight: float = 1.0     # - weight * mean(max(0, margin - gap to nearest drone) / margin) per step
     separation_margin: float = 0.3     # gap (m, surface to surface) below which drones are penalised; 0 disables
     obstacle_weight: float = 1.0       # - weight * mean(max(0, margin - clearance) / margin) per step
@@ -250,3 +255,13 @@ def validate(cfg: Config) -> None:
             raise ValueError("env.start_center +- (start_spread + start_jitter) leaves the world; move it inward")
     if not e.random_target and not all(lo <= v <= hi for v in e.target):
         raise ValueError("env.target leaves the world")
+    if r.wall_weight > 0 and r.wall_margin <= 0:
+        raise ValueError(
+            "reward.wall_weight needs reward.wall_margin > 0"
+        )
+    if r.formation_weight < 0:
+        raise ValueError("reward.formation_weight must be non-negative")
+    if not 0.0 <= e.action_residual_scale <= 1.0:
+        raise ValueError(
+            "env.action_residual_scale must be between 0 and 1"
+        )

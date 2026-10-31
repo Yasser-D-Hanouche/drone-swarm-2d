@@ -54,7 +54,13 @@ def rollout(env, policy, seed):
     obs, _ = env.reset(seed=seed)
     traj = [env.positions.copy()]
     terms = dict.fromkeys(REWARD_TERMS, 0.0)
-    form_errors, min_clear, min_pair, min_mean_dist, path = [], math.inf, math.inf, math.inf, 0.0
+    cohesion_errors = []
+    formation_errors = []
+
+    min_clear = math.inf
+    min_pair = math.inf
+    min_mean_dist = math.inf
+    path = 0.0
 
     while True:
         prev = env.positions.copy()
@@ -63,7 +69,8 @@ def rollout(env, policy, seed):
         path += float(np.linalg.norm(env.positions - prev, axis=1).mean())
         for k, v in info["reward_terms"].items():
             terms[k] += v
-        form_errors.append(info["cohesion_error"])
+        cohesion_errors.append(info["cohesion_error"])
+        formation_errors.append(info["formation_error"])
         min_clear = min(min_clear, info["min_obstacle_clearance"])
         min_pair = min(min_pair, info["min_pair_distance"])
         min_mean_dist = min(min_mean_dist, info["mean_target_distance"])
@@ -89,7 +96,8 @@ def rollout(env, policy, seed):
         "path_length": path,
         "min_obstacle_clearance": min_clear,
         "min_pair_distance": min_pair,
-        "mean_cohesion_error": float(np.mean(form_errors)),
+        "mean_cohesion_error": float(np.mean(cohesion_errors)),
+        "mean_formation_error": float(np.mean(formation_errors)),
         "collision_x": cx,
         "collision_y": cy,
     }
@@ -145,6 +153,7 @@ def summarize(rows):
         "mean_path_length": mean("path_length"),
         "mean_min_obstacle_clearance": mean("min_obstacle_clearance"),
         "mean_cohesion_error": mean("mean_cohesion_error"),
+        "mean_formation_error": mean("mean_formation_error"),
         "mean_terms": {k: mean(f"r_{k}") for k in REWARD_TERMS},
         "reward_by_outcome": {o: float(np.mean([r["reward"] for r in v])) for o, v in by_outcome.items() if v},
         "terms_by_outcome": {
@@ -397,12 +406,12 @@ def write_report(path, cfg: Config, overrides: dict, summaries: dict, diagnosis:
     lines += [f"- `{k} = {v}`" for k, v in changed.items()] or ["- none (defaults)"]
 
     lines += ["", "## Results (same evaluation seeds for every policy)", "",
-              "| Policy | Success [95% CI] | Collision | Timeout | Target found | Return | Steps | Final dist | Worst drone dist |",
-              "|---|---|---|---|---|---|---|---|---|"]
+              "| Policy | Success [95% CI] | Collision | Timeout | Target found | Return | Steps | Final dist | Worst drone dist | Formation error |",
+              "|---|---|---|---|---|---|---|---|---|---|",]
     for name, s in summaries.items():
         lines.append(
             f"| {name} | {_fmt_rate(s)} | {s['collision_rate']:.0%} | {s['outcome_rates']['timeout']:.0%} | {s['found_rate']:.0%} | "
-            f"{s['mean_reward']:.1f} ± {s['std_reward']:.1f} | {s['mean_steps']:.0f} | {s['mean_final_dist']:.2f} | {s['mean_worst_final_dist']:.2f} |"
+            f"{s['mean_reward']:.1f} ± {s['std_reward']:.1f} | {s['mean_steps']:.0f} | {s['mean_final_dist']:.2f} | {s['mean_worst_final_dist']:.2f} | {s['mean_formation_error']:.3f} |"
         )
 
     lines += ["", "## How episodes end", "", "| Policy | " + " | ".join(OUTCOMES) + " |", "|---|" + "---|" * len(OUTCOMES)]
