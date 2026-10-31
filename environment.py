@@ -14,6 +14,7 @@ REWARD_TERMS = [
     "progress",
     "exploration",
     "cohesion",
+    "formation",
     "separation",
     "step",
     "obstacle_proximity",
@@ -161,6 +162,42 @@ class DroneSwarm2D(gym.Env):
         dist = np.linalg.norm(self.positions - self.positions.mean(axis=0), axis=1)
         return np.maximum(dist - self.cfg.cohesion_radius, 0.0)
 
+    def _formation_error(self):
+        """
+        Mean absolute error between current pairwise distances
+        and the distances of the initial regular polygon formation.
+
+        The formation may translate and rotate freely.
+        """
+        n = self.n
+
+        # Get all unique drone pairs (i, j), where i < j.
+        i, j = np.triu_indices(n, k=1)
+
+        # Current distance between each pair.
+        current_distances = np.linalg.norm(
+            self.positions[i] - self.positions[j],
+            axis=1
+        )
+
+        # Expected distances in the initial circular formation.
+        index_distance = np.abs(i - j)
+        index_distance = np.minimum(
+            index_distance,
+            n - index_distance
+        )
+
+        desired_distances = (
+            2.0
+            * self.cfg.start_spread
+            * np.sin(np.pi * index_distance / n)
+        )
+
+        # Average absolute deviation from the desired distances.
+        return float(np.mean(
+            np.abs(current_distances - desired_distances)
+        ))
+
     def _update_search(self):
         # Returns the number of cells searched for the first time this step; may flip target_found.
         c = self.cfg
@@ -273,7 +310,24 @@ class DroneSwarm2D(gym.Env):
 
     def step(self, actions):
         c, w = self.cfg, self.rw
-        actions = np.clip(np.asarray(actions, dtype=np.float32), -1.0, 1.0)
+        actions = np.asarray(actions, dtype=np.float32)
+        if actions.shape != (self.n, 2):
+            raise ValueError(
+                f"Expected actions of shape {(self.n, 2)}, "
+                f"received {actions.shape}"
+            )
+
+        actions = np.clip(actions, -1.0, 1.0)
+
+        # Couple drone actions to encourage coordinated swarm movement.
+        shared_action = actions.mean(axis=0, keepdims=True)
+
+        actions = (
+            shared_action
+            + c.action_residual_scale * (actions - shared_action)
+        )
+
+        actions = np.clip(actions, -1.0, 1.0)
 
         old_dist = np.linalg.norm(self.positions - self.target, axis=1)
 
@@ -294,6 +348,9 @@ class DroneSwarm2D(gym.Env):
         progress = float(np.mean(old_dist - target_dist)) if self.target_found else 0.0
         cohesion_excess = self._cohesion_excess()
         cohesion_error = float(cohesion_excess.mean())
+
+        formation_error = self._formation_error()
+
         min_pair = float(pair.min())
 
         crash = None
@@ -315,6 +372,7 @@ class DroneSwarm2D(gym.Env):
         terms = dict.fromkeys(REWARD_TERMS, 0.0)
         terms["progress"] = w.progress_weight * progress
         terms["cohesion"] = -w.cohesion_weight * cohesion_error
+        terms["formation"] = -w.formation_weight * formation_error
         terms["step"] = -w.step_penalty
         if not was_found:
             terms["exploration"] = w.explore_weight * newly_searched
@@ -325,13 +383,13 @@ class DroneSwarm2D(gym.Env):
         if w.obstacle_margin > 0:
             proximity = np.maximum(0.0, w.obstacle_margin - obs_clear) / w.obstacle_margin
             terms["obstacle_proximity"] = -w.obstacle_weight * float(np.mean(proximity))
-        if w.obstacle_margin > 0:
-            proximity = np.maximum(
-                0.0, w.obstacle_margin - obs_clear
-            ) / w.obstacle_margin
+        if w.wall_margin > 0:
+            wall_proximity = np.maximum(
+                0.0, w.wall_margin - wall_clear
+            ) / w.wall_margin
 
-            terms["obstacle_proximity"] = (
-                -w.obstacle_weight * float(np.mean(proximity))
+            terms["wall_proximity"] = (
+                -w.wall_weight * float(np.mean(wall_proximity))
             )
         if collision:
             terms["collision"] = -w.collision_penalty
@@ -345,6 +403,7 @@ class DroneSwarm2D(gym.Env):
         info = {
             "success": success,
             "collision": collision,
+            "formation_error": formation_error,
             "termination": crash or ("success" if success else ("timeout" if truncated else "running")),
             "collision_pos": None if collision_pos is None else [float(collision_pos[0]), float(collision_pos[1])],
             "cohesion_error": cohesion_error,
