@@ -111,15 +111,17 @@ An episode is:
 - truncated at the max_steps time limit.
 The evaluation code distinguishes success, obstacle, boundary, drone collision and timeout.
 3.5 Vision and observation
-The observation has 152 values:
-- Per drone: 17 values × 3 = 51.
-  - Position normalized by world size (2).
-  - Velocity normalized by maximum speed (2).
-  - Target vector normalized by world size (2); zeros before target discovery.
-  - Relative positions of the other two drones (4).
-  - Seven ray readings (7).
-- Global target-found flag (1).
-- Searched map (100).
+One network with shared weights controls all drones. Each drone gets its own observation row of 124 values (the same layout for every drone), and its action is a 2D acceleration. Both are expressed in the drone's own frame, whose +x axis points from that drone to the target, fixed when the target is found (world axes before that). The drone's own network input contains:
+- Velocity normalized by maximum speed (2).
+- Target vector normalized by world size (2); zeros before target discovery.
+- Relative positions of the other two drones, nearest first, clipped to +-3 m and divided by 3 (4).
+- Heading relative to the frame as cos, sin (2).
+- Seven ray readings (7).
+- Distance to the wall along the frame's +x, -x, +y, -y, divided by vision_range (4).
+- Target-found flag (1).
+- Own position scaled to [-1, 1]; zeros once the target is found (2).
+- Searched map (100); zeros once the target is found.
+Training treats every drone as one row of the vector environment, with the shared team reward, so one update holds n_steps * n_envs * num_drones samples. run.timesteps counts environment steps.
 The seven vision rays span 120 degrees, extend 2.0 m and point along the drone's velocity/heading direction. A ray reports the nearest obstacle, wall or other drone. The rays do not identify the object type and do not see fully behind the drone or to the sides beyond the ray span.
 
 The default policy is an MLP without recurrent memory. It does not retain a persistent obstacle map beyond information explicitly included in the observation. An LSTM/RecurrentPPO policy has not been implemented.
@@ -128,9 +130,9 @@ The default policy is an MLP without recurrent memory. It does not retain a pers
 The configuration described in the original project README is:
 Parameter	Value
 Learning rate	3e-4
-Number of environments	1
-Rollout steps per environment	1024
-Batch size	64
+Number of environments	2 (SubprocVecEnv)
+Rollout steps per environment	512
+Batch size	192 (drone samples; 3072 per update)
 Epochs	10
 Discount factor (gamma)	0.99
 GAE lambda	0.95
@@ -218,7 +220,7 @@ The last verified config.json for stage1_formation_seed42 contained wall_weight=
 
 The report's “Changes vs defaults” table only reports values different from the current config.py defaults. If the default itself has been changed to wall_weight=3.0 or formation_weight=0.5, those values will not necessarily appear in that table. Always inspect the run's config.json when the exact settings matter.
 5.2 Reward components
-Every term is accumulated per step and logged separately as r_<term>.
+Every term is accumulated per step and logged separately as r_<term>. Rewards are personal: each drone gets its own progress, cohesion, formation, separation, obstacle and wall terms, its own share of newly searched cells, and the collision penalty only if it caused the crash. The success bonus is paid to every drone, since success needs all of them at the target. The logged r_<term> values are the averages over the drones, so the collision term is smaller than the old team-wide -10 when only one drone crashes.
 Term	Meaning / calculation	Current useful setting
 progress	Reward for reducing target distance, only after the target is found. Original implementation uses mean progress across drones.	Weight 2.0
 exploration	Reward for newly searched cells, only before target discovery.	Weight 0.2

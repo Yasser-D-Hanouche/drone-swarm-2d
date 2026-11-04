@@ -14,6 +14,7 @@ from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 from config import Config
 from diagnostics import ppo_policy, run_episodes, summarize
 from environment import OUTCOMES, REWARD_TERMS, DroneSwarm2D
+from swarm_vec_env import SharedPolicyVecEnv
 
 
 class TrainingMonitor(BaseCallback):
@@ -21,10 +22,16 @@ class TrainingMonitor(BaseCallback):
         super().__init__()
         self.cfg = cfg
         self.console = console
+        self.n_drones = cfg.env.num_drones
         self.episodes: list[dict] = []
         self.eval_curve: list[dict] = []
         self._since_log = 0
         self._next_eval = cfg.run.eval_freq
+
+    @property
+    def env_steps(self):
+        # SB3 counts one timestep per drone row; run.timesteps counts environment steps.
+        return self.num_timesteps // self.n_drones
 
     def _on_training_start(self):
         n_envs = self.training_env.num_envs
@@ -33,12 +40,14 @@ class TrainingMonitor(BaseCallback):
 
     def _on_step(self):
         for i, (info, done) in enumerate(zip(self.locals["infos"], self.locals["dones"])):
+            if i % self.n_drones:  # all drones of a swarm share one episode; log it once
+                continue
             for k, v in info["reward_terms"].items():
                 self._acc[i][k] += v
             self._len[i] += 1
             if done:
                 row = {
-                    "timesteps": self.num_timesteps,
+                    "timesteps": self.env_steps,
                     "outcome": info["termination"],
                     "reward": sum(self._acc[i].values()),
                     "length": self._len[i],
@@ -50,7 +59,7 @@ class TrainingMonitor(BaseCallback):
                 self._len[i] = 0
 
         run = self.cfg.run
-        if run.eval_freq and self.num_timesteps >= self._next_eval:
+        if run.eval_freq and self.env_steps >= self._next_eval:
             self._periodic_eval()
             self._next_eval += run.eval_freq
         return True
@@ -62,7 +71,7 @@ class TrainingMonitor(BaseCallback):
         n = run.periodic_eval_episodes if random_env else 1
         s = summarize(run_episodes(self.cfg, ppo_policy(self.model), n, run.seed + 5000))
         self.eval_curve.append({
-            "timesteps": self.num_timesteps,
+            "timesteps": self.env_steps,
             "success_rate": s["success_rate"],
             "collision_rate": s["collision_rate"],
             "mean_reward": s["mean_reward"],
@@ -83,7 +92,7 @@ class TrainingMonitor(BaseCallback):
             self.logger.record(f"reward_term/{k}", float(np.mean([r[f"r_{k}"] for r in recent])))
         if self.console:
             print(
-                f"[{self.num_timesteps:>8,}/{self.cfg.run.timesteps:,}] episodes={len(recent):>3} "
+                f"[{self.env_steps:>8,}/{self.cfg.run.timesteps:,}] episodes={len(recent):>3} "
                 f"success={rate['success']:.0%} obstacle={rate['obstacle']:.0%} boundary={rate['boundary']:.0%} "
                 f"drone={rate['drone_collision']:.0%} timeout={rate['timeout']:.0%} "
                 f"return={np.mean([r['reward'] for r in recent]):.1f}"
@@ -107,6 +116,7 @@ def train(cfg: Config, run_dir: Path, console: bool = True):
         seed=cfg.run.seed,
         vec_env_cls=SubprocVecEnv if p.n_envs > 1 else None,
     )
+    env = SharedPolicyVecEnv(env, cfg.env.num_drones)  # one network, trained on every drone's experience
     if p.normalize_reward:
         # Observations stay raw, so evaluation and saved models need no normalisation statistics.
         env = VecNormalize(env, norm_obs=False, norm_reward=True, gamma=p.gamma)
@@ -128,7 +138,7 @@ def train(cfg: Config, run_dir: Path, console: bool = True):
     )
     model.set_logger(configure(str(run_dir / "sb3_log"), _log_formats()))
     monitor = TrainingMonitor(cfg, console=console)
-    model.learn(total_timesteps=cfg.run.timesteps, callback=monitor)
+    model.learn(total_timesteps=cfg.run.timesteps * cfg.env.num_drones, callback=monitor)
     model.save(str(run_dir / "model"))
     env.close()
     return model, monitor

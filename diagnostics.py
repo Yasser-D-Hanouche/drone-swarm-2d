@@ -41,7 +41,7 @@ def greedy_policy(env):
         to_goal = goal + (env.positions - centroid) - env.positions
         dist = np.linalg.norm(to_goal, axis=1, keepdims=True)
         desired = to_goal / np.maximum(dist, 1e-8) * np.minimum(env.cfg.max_speed, dist)
-        return np.clip((desired - env.velocities) / (env.cfg.max_accel * env.cfg.dt), -1.0, 1.0)
+        return np.clip(env.to_frame((desired - env.velocities) / (env.cfg.max_accel * env.cfg.dt)), -1.0, 1.0)
 
     return act
 

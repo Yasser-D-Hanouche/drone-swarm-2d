@@ -53,19 +53,24 @@ def draw_scene(ax, cfg: EnvConfig, obstacles=None, target=None):
 
 
 class DroneSwarm2D(gym.Env):
-    """One centralised policy controls all drones.
+    """One policy, with weights shared across drones, controls all drones.
 
-    Action: (n, 2) world-frame acceleration per drone in [-1, 1] (scaled by max_accel).
+    Action: (n, 2) acceleration per drone in [-1, 1] (scaled by max_accel), expressed in the drone's own frame (see below).
     The target position is hidden. A drone senses it only within target_sense_range; once any drone has,
     the whole swarm knows it (shared). Until then the swarm must search, guided by a coarse map of the
     area already searched (cells whose centre has been within sensing range of a drone).
     Goal: find the target, then bring every drone within success_radius of it while staying together
     (within cohesion_radius of the swarm centroid) and clear of obstacles, walls and each other.
-    Observation = per-drone blocks, then global items:
-      per drone: pos/world_size (2) | vel/max_speed (2) | (target - pos)/world_size, zeros until found (2) |
-        relative position of every other drone, clipped +-3 world units then divided by 3 (2*(n-1)) |
-        rays (num_rays; 1.0 = nothing within vision_range). Rays point along the drone's velocity direction.
-      global: target_found flag (1) | searched map, grid x grid cells of explore_cell, row-major, 1 = searched.
+    Drone frame: each drone's axes are rotated so +x points from that drone to the target, fixed at the moment the
+    target is found (world axes until then). Observed vectors and actions use it, so one learned behaviour covers every direction.
+    Observation = (n, obs_dim): one row per drone, the same layout for every drone:
+      vel/max_speed (2) | (target - pos)/world_size, zeros until found (2) |
+        relative position of every other drone, nearest first, clipped +-3 world units then divided by 3 (2*(n-1)) |
+        heading relative to the frame as cos, sin (2) |
+        rays (num_rays; 1.0 = nothing within vision_range), pointing along the drone's velocity direction |
+        distance to the wall along +x, -x, +y, -y of the frame, divided by vision_range (4) |
+        target_found flag (1) | pos/world_size*2-1, zeros once found (2) |
+        searched map, grid x grid cells of explore_cell, row-major, 1 = searched, zeros once found.
     The policy is memoryless: obstacles seen earlier are forgotten unless they are currently in the rays.
     """
 
@@ -91,9 +96,10 @@ class DroneSwarm2D(gym.Env):
         gx, gy = np.meshgrid(axis, axis, indexing="ij")
         self.cell_centers = np.stack([gx.ravel(), gy.ravel()], axis=1).astype(np.float32)
 
-        obs_dim = self.n * (6 + 2 * (self.n - 1) + self.cfg.num_rays) + 1 + len(self.cell_centers)
+        obs_dim = 13 + 2 * (self.n - 1) + self.cfg.num_rays + len(self.cell_centers)
         self.action_space = spaces.Box(-1.0, 1.0, shape=(self.n, 2), dtype=np.float32)
-        self.observation_space = spaces.Box(-np.inf, np.inf, shape=(obs_dim,), dtype=np.float32)
+        self.observation_space = spaces.Box(-np.inf, np.inf, shape=(self.n, obs_dim), dtype=np.float32)
+        self.frame_angle = np.zeros(self.n, dtype=np.float32)
         self.reset()
 
     def _raycast(self):
@@ -135,74 +141,99 @@ class DroneSwarm2D(gym.Env):
         dist = np.linalg.norm(self.positions - self.positions.mean(axis=0), axis=1)
         return np.maximum(dist - self.cfg.cohesion_radius, 0.0)
 
-    def _formation_error(self):
+    def _formation_errors(self):
         """
-        Mean absolute error between current pairwise distances
+        Per drone: mean absolute error between its distances to the other drones
         and the distances of the initial regular polygon formation.
 
         The formation may translate and rotate freely.
         """
         n = self.n
-
-        # Get all unique drone pairs (i, j), where i < j.
-        i, j = np.triu_indices(n, k=1)
-
-        # Current distance between each pair.
-        current_distances = np.linalg.norm(
-            self.positions[i] - self.positions[j],
-            axis=1
-        )
-
-        # Expected distances in the initial circular formation.
-        index_distance = np.abs(i - j)
-        index_distance = np.minimum(
-            index_distance,
-            n - index_distance
-        )
-
-        desired_distances = (
-            2.0
-            * self.cfg.start_spread
-            * np.sin(np.pi * index_distance / n)
-        )
-
-        # Average absolute deviation from the desired distances.
-        return float(np.mean(
-            np.abs(current_distances - desired_distances)
-        ))
+        current = np.linalg.norm(self.positions[:, None, :] - self.positions[None, :, :], axis=2)
+        index_distance = np.abs(np.arange(n)[:, None] - np.arange(n)[None, :])
+        index_distance = np.minimum(index_distance, n - index_distance)
+        desired = 2.0 * self.cfg.start_spread * np.sin(np.pi * index_distance / n)
+        error = np.abs(current - desired)
+        np.fill_diagonal(error, 0.0)
+        return error.sum(axis=1) / (n - 1)
 
     def _update_search(self):
-        # Returns the number of cells searched for the first time this step; may flip target_found.
+        # Returns per drone the number of cells it searched for the first time (shared if several drones are first); may flip target_found.
         c = self.cfg
         d = np.linalg.norm(self.positions[:, None, :] - self.cell_centers[None, :, :], axis=2)
-        seen = (d <= c.target_sense_range).any(axis=0)
-        newly = int((seen & ~self.searched).sum())
-        self.searched |= seen
-        if np.linalg.norm(self.positions - self.target, axis=1).min() <= c.target_sense_range:
+        seen = d <= c.target_sense_range
+        fresh = seen & ~self.searched[None, :]
+        newly = (fresh / np.maximum(fresh.sum(axis=0, keepdims=True), 1)).sum(axis=1)
+        self.searched |= seen.any(axis=0)
+        if not self.target_found and np.linalg.norm(self.positions - self.target, axis=1).min() <= c.target_sense_range:
             self.target_found = True
+            to = self.target - self.positions
+            self.frame_angle = np.arctan2(to[:, 1], to[:, 0]).astype(np.float32)
         return newly
 
-    def _observation(self):
+    def _rot(self):
+        # (n, 2, 2): per-drone rotation from its own frame to world axes.
+        c, s = np.cos(self.frame_angle), np.sin(self.frame_angle)
+        return np.stack([np.stack([c, -s], axis=1), np.stack([s, c], axis=1)], axis=1).astype(np.float32)
+
+    def to_frame(self, v):
+        # World-frame row vectors (one per drone) -> each drone's own frame.
+        return np.einsum("ni,nij->nj", np.asarray(v, dtype=np.float32), self._rot())
+
+    def from_frame(self, v):
+        return np.einsum("nj,nij->ni", np.asarray(v, dtype=np.float32), self._rot())
+
+    def _wall_distances(self):
+        # Distance to the wall along +x, -x, +y, -y of each drone's frame, normalised by vision_range.
         c = self.cfg
-        rays = self._raycast()
+        rot = self._rot().astype(np.float64)
+        axes = np.stack([rot[:, :, 0], -rot[:, :, 0], rot[:, :, 1], -rot[:, :, 1]], axis=1)  # (n, 4, 2) in world coordinates
+        pos = self.positions.astype(np.float64)[:, None, :]
+        moving = np.abs(axes) > 1e-6
+        bound = np.where(axes > 0, c.world_size - c.drone_radius, c.drone_radius)
+        t = np.where(moving, (bound - pos) / np.where(moving, axes, 1.0), np.inf)  # (n, 4, 2)
+        return (np.clip(t.min(axis=2), 0.0, c.vision_range) / c.vision_range).astype(np.float32)
+
+    def _observation(self):
+        c, n = self.cfg, self.n
+        rot = self._rot()
+        found = float(self.target_found)
+
         if self.target_found:
-            to_target = (self.target - self.positions) / c.world_size
+            to_target = self.to_frame((self.target - self.positions) / c.world_size)
         else:
-            to_target = np.zeros((self.n, 2), dtype=np.float32)
-        rel = self.positions[None, :, :] - self.positions[:, None, :]
-        rel = rel[~np.eye(self.n, dtype=bool)].reshape(self.n, -1)
+            to_target = np.zeros((n, 2), dtype=np.float32)
+
+        diff = self.positions[None, :, :] - self.positions[:, None, :]  # [i, j] = pos_j - pos_i
+        dist = np.linalg.norm(diff, axis=2)
+        np.fill_diagonal(dist, np.inf)
+        order = np.argsort(dist, axis=1)[:, : n - 1]
+        rel = np.take_along_axis(diff, order[:, :, None], axis=1)
+        rel = np.einsum("nmi,nij->nmj", np.clip(rel, -3.0, 3.0) / 3.0, rot).reshape(n, -1)
+
+        heading = self.headings - self.frame_angle
+        if self.target_found:
+            own_pos = np.zeros((n, 2), dtype=np.float32)
+            searched = np.zeros((n, len(self.cell_centers)), dtype=np.float32)
+        else:
+            own_pos = 2.0 * self.positions / c.world_size - 1.0
+            searched = np.tile(self.searched.astype(np.float32), (n, 1))
+
         per_drone = np.concatenate(
             [
-                self.positions / c.world_size,
-                self.velocities / c.max_speed,
+                self.to_frame(self.velocities / c.max_speed),
                 to_target,
-                np.clip(rel, -3.0, 3.0) / 3.0,
-                rays,
+                rel,
+                np.stack([np.cos(heading), np.sin(heading)], axis=1),
+                self._raycast(),
+                self._wall_distances(),
+                np.full((n, 1), found),
+                own_pos,
+                searched,
             ],
             axis=1,
         )
-        global_part = np.concatenate([[float(self.target_found)], self.searched.astype(np.float32)])
-        return np.concatenate([per_drone.flatten(), global_part]).astype(np.float32)
+        return per_drone.astype(np.float32)
 
     def _generate_obstacles(self):
         c = self.cfg
@@ -261,6 +292,7 @@ class DroneSwarm2D(gym.Env):
         self.steps = 0
         self.searched = np.zeros(len(self.cell_centers), dtype=bool)
         self.target_found = False
+        self.frame_angle = np.zeros(self.n, dtype=np.float32)
         self._update_search()
         if self.target_found:
             # Rays follow the heading, so point it at the known target instead of a random direction.
@@ -295,17 +327,10 @@ class DroneSwarm2D(gym.Env):
                 f"received {actions.shape}"
             )
 
-        actions = np.clip(actions, -1.0, 1.0)
-
-        # Couple drone actions to encourage coordinated swarm movement.
+        # Actions are in each drone's own frame; convert to world axes before the optional coupling.
+        actions = self.from_frame(np.clip(actions, -1.0, 1.0))
         shared_action = actions.mean(axis=0, keepdims=True)
-
-        actions = (
-            shared_action
-            + c.action_residual_scale * (actions - shared_action)
-        )
-
-        actions = np.clip(actions, -1.0, 1.0)
+        actions = shared_action + c.action_residual_scale * (actions - shared_action)
 
         old_dist = np.linalg.norm(self.positions - self.target, axis=1)
 
@@ -325,59 +350,61 @@ class DroneSwarm2D(gym.Env):
         target_dist, pair, nearest, obs_clear, wall_clear = self._geometry()
         # Success needs every drone at the target, so weight the farthest drone's progress as well as the mean.
         if self.target_found:
-            progress = 0.5 * float(np.mean(old_dist - target_dist)) + 0.5 * float(old_dist.max() - target_dist.max())
+            progress = old_dist - target_dist
         else:
-            progress = 0.0
+            progress = np.zeros(self.n)
         cohesion_excess = self._cohesion_excess()
         cohesion_error = float(cohesion_excess.mean())
 
-        formation_error = self._formation_error()
+        formation_errors = self._formation_errors()
+        formation_error = float(formation_errors.mean())
 
         min_pair = float(pair.min())
 
         crash = None
         collision_pos = None
+        culprits = np.zeros(self.n, dtype=bool)  # drones that caused the crash; they get the collision penalty
         if obs_clear.min() < 0:
             crash = "obstacle"
+            culprits = obs_clear < 0
             collision_pos = self.positions[int(obs_clear.argmin())]
         elif wall_clear.min() < 0:
             crash = "boundary"
+            culprits = wall_clear < 0
             collision_pos = self.positions[int(wall_clear.argmin())]
         elif min_pair < 2 * c.drone_radius:
             crash = "drone_collision"
+            culprits = nearest < 2 * c.drone_radius
             i, j = np.unravel_index(int(pair.argmin()), pair.shape)
             collision_pos = (self.positions[i] + self.positions[j]) / 2
 
         collision = crash is not None
         success = bool(np.all(target_dist < c.success_radius)) and not collision
 
-        terms = dict.fromkeys(REWARD_TERMS, 0.0)
+        # Every term is a vector with one value per drone, so each drone is rewarded for its own behaviour.
+        terms = {k: np.zeros(self.n) for k in REWARD_TERMS}
         terms["progress"] = w.progress_weight * progress
-        terms["cohesion"] = -w.cohesion_weight * cohesion_error
-        terms["formation"] = -w.formation_weight * formation_error
-        terms["step"] = -w.step_penalty
+        terms["cohesion"] = -w.cohesion_weight * cohesion_excess
+        terms["formation"] = -w.formation_weight * formation_errors
+        terms["step"] = np.full(self.n, -w.step_penalty)
         if not was_found:
             terms["exploration"] = w.explore_weight * newly_searched
         if w.separation_margin > 0:
             gap = nearest - 2 * c.drone_radius
             close = np.maximum(0.0, w.separation_margin - gap) / w.separation_margin
-            terms["separation"] = -w.separation_weight * float(np.mean(close))
+            terms["separation"] = -w.separation_weight * close
         if w.obstacle_margin > 0:
             proximity = np.maximum(0.0, w.obstacle_margin - obs_clear) / w.obstacle_margin
-            terms["obstacle_proximity"] = -w.obstacle_weight * float(np.mean(proximity))
+            terms["obstacle_proximity"] = -w.obstacle_weight * proximity
         if w.wall_margin > 0:
-            wall_proximity = np.maximum(
-                0.0, w.wall_margin - wall_clear
-            ) / w.wall_margin
-
-            terms["wall_proximity"] = (
-                -w.wall_weight * float(np.mean(wall_proximity))
-            )
+            wall_proximity = np.maximum(0.0, w.wall_margin - wall_clear) / w.wall_margin
+            terms["wall_proximity"] = -w.wall_weight * wall_proximity
         if collision:
-            terms["collision"] = -w.collision_penalty
+            terms["collision"] = -w.collision_penalty * culprits
         if success:
-            terms["success"] = w.success_bonus
-        reward = float(sum(terms.values()))
+            terms["success"] = np.full(self.n, w.success_bonus)  # all drones are at the target, so all share the bonus
+        drone_rewards = np.sum(list(terms.values()), axis=0)
+        reward = float(drone_rewards.mean())
 
         terminated = collision or success
         truncated = self.steps >= self.max_steps and not terminated
@@ -395,7 +422,8 @@ class DroneSwarm2D(gym.Env):
             "max_target_distance": float(np.max(target_dist)),
             "min_obstacle_clearance": float(obs_clear.min()),
             "min_pair_distance": min_pair,
-            "reward_terms": terms,
+            "reward_terms": {k: float(v.mean()) for k, v in terms.items()},
+            "drone_rewards": drone_rewards.astype(np.float32),
         }
         return self._observation(), reward, terminated, truncated, info
 

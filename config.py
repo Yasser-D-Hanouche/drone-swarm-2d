@@ -79,8 +79,8 @@ class RewardConfig:
 class PPOConfig:
     learning_rate: float = 3e-4
     n_envs: int = 2                    # parallel environments (separate processes if > 1); n_steps below is per environment
-    n_steps: int = 512                 # rollout length per environment per update; n_envs * n_steps = samples per update (keep 1024)
-    batch_size: int = 64               # must not exceed n_steps; ideally divides n_steps * n_envs
+    n_steps: int = 512                 # rollout length per environment per update; n_envs * n_steps = environment steps per update (keep 1024)
+    batch_size: int = 192              # minibatch of drone samples; one update holds n_steps * n_envs * num_drones samples (3072 by default)
     n_epochs: int = 10
     gamma: float = 0.99                # discount; 0.99 looks ~100 steps (10 s) ahead
     gae_lambda: float = 0.95
@@ -96,7 +96,7 @@ class RunConfig:
     name: str = "baseline"             # run folder suffix; runs with the same name are grouped as seeds by compare_runs.py
     hypothesis: str = ""               # one sentence: what do you expect this run to show? goes in the report
     seed: int = 42
-    timesteps: int = 100_000           # total training steps over all environments
+    timesteps: int = 100_000           # total training steps in environment steps (each step gives one sample per drone)
     eval_episodes: int = 30            # final evaluation episodes (same seeds for every policy)
     eval_freq: int = 50_000            # periodic evaluation during training; 0 disables
     periodic_eval_episodes: int = 10
@@ -218,8 +218,8 @@ def validate(cfg: Config) -> None:
         raise ValueError("run.timesteps and run.eval_episodes must be positive")
     if p.n_envs < 1:
         raise ValueError("ppo.n_envs must be at least 1")
-    if p.batch_size > p.n_steps:
-        raise ValueError("ppo.batch_size must not exceed ppo.n_steps")
+    if p.batch_size > p.n_steps * p.n_envs * e.num_drones:
+        raise ValueError("ppo.batch_size must not exceed ppo.n_steps * ppo.n_envs * env.num_drones")
     if r.obstacle_weight > 0 and r.obstacle_margin <= 0:
         raise ValueError("reward.obstacle_weight needs reward.obstacle_margin > 0")
     if r.separation_weight > 0 and r.separation_margin <= 0:
