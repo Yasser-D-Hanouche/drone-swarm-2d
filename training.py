@@ -4,11 +4,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.logger import configure
-from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 
 from config import Config
 from diagnostics import ppo_policy, run_episodes, summarize
@@ -99,12 +100,16 @@ def _log_formats():
 
 def train(cfg: Config, run_dir: Path, console: bool = True):
     p = cfg.ppo
+    torch.set_num_threads(1)  # tiny MLP: multi-threaded CPU ops add overhead and no speed-up
     env = make_vec_env(
         lambda: DroneSwarm2D(cfg.env, cfg.reward),
         n_envs=p.n_envs,
         seed=cfg.run.seed,
         vec_env_cls=SubprocVecEnv if p.n_envs > 1 else None,
     )
+    if p.normalize_reward:
+        # Observations stay raw, so evaluation and saved models need no normalisation statistics.
+        env = VecNormalize(env, norm_obs=False, norm_reward=True, gamma=p.gamma)
     model = PPO(
         "MlpPolicy",
         env,

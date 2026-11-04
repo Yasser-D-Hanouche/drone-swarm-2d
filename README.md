@@ -200,7 +200,7 @@ env.target_sense_range	20.0	Target known from the beginning.
 env.min_obstacles	0	Stage 1.
 env.max_obstacles	0	Stage 1.
 env.action_residual_scale	1.0	Original independent actions; coupling at 0.25 performed poorly.
-reward.progress_weight	2.0	Original mean-distance progress reward; bottleneck variant is only proposed.
+reward.progress_weight	2.0	Blend of mean and worst-drone progress (0.5/0.5). Earlier results used mean-only.
 reward.cohesion_weight	0.5	Centroid cohesion.
 reward.formation_weight	0.5	Pairwise triangular-formation reward.
 reward.separation_weight	1.0	Keep at original value.
@@ -309,7 +309,7 @@ defaults in config.py
   < --set section.parameter=value
 --set values are JSON-like values. Use true/`false` for booleans and numeric values without quotes.
 6.4 Slurm
-A Slurm template exists in the original README but is untested for this exact cluster allocation. The multi-process ppo.n_envs > 1 path was also marked untested. Validate it with a short job before using it for expensive runs. Do not assume that more parallel environments improve throughput; the raycast implementation is Python-heavy and may be the bottleneck.
+A Slurm template exists in the original README but is untested for this exact cluster allocation. The default is now ppo.n_envs=2 with ppo.n_steps=512 (still 1024 samples per update), which uses separate processes and has not been validated yet: smoke-test it with a short job and request at least n_envs CPUs (--cpus-per-task) before expensive runs. Earlier results used n_envs=1, n_steps=1024.
 7. Evaluation and experiment artifacts
 run_experiment.py evaluates three policies on the same final evaluation seeds:
 - Random: random actions; a floor/reference, not a meaningful navigation controller.
@@ -553,7 +553,7 @@ The fully randomized task is expected to be difficult for a memoryless MLP. Some
 - No periodic model checkpoints or resume-after-interruption mechanism has been reported; the runner saves the final model.
 - No frequency/duration metric for cohesion or formation violations has been reported; only mean errors are recorded.
 - The policy is feed-forward and has no explicit temporal memory for obstacles.
-- Raycasting is a Python loop and may limit throughput; vectorization may be needed before scaling parallel environments.
+- Raycasting is vectorised with NumPy; it was not benchmarked or compared against the old loop version on this cluster. Results in section 8 predate the vectorised raycast, blended progress reward, relative-position scaling (/3), per-episode-phase change and reward normalisation (ppo.normalize_reward), so they are not directly comparable to new runs.
 - ppo.n_envs > 1 / multi-process training was not validated in the original README; smoke-test it before cluster-scale use.
 - Thirty evaluation episodes give relatively wide confidence intervals; use more episodes for final reporting.
 - min_obstacle_clearance=inf is expected in zero-obstacle Stage 1 runs; it is not a numerical error in that context.

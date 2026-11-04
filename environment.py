@@ -63,7 +63,7 @@ class DroneSwarm2D(gym.Env):
     (within cohesion_radius of the swarm centroid) and clear of obstacles, walls and each other.
     Observation = per-drone blocks, then global items:
       per drone: pos/world_size (2) | vel/max_speed (2) | (target - pos)/world_size, zeros until found (2) |
-        relative position of every other drone, world units, clipped +-3 (2*(n-1)) |
+        relative position of every other drone, clipped +-3 world units then divided by 3 (2*(n-1)) |
         rays (num_rays; 1.0 = nothing within vision_range). Rays point along the drone's velocity direction.
       global: target_found flag (1) | searched map, grid x grid cells of explore_cell, row-major, 1 = searched.
     The policy is memoryless: obstacles seen earlier are forgotten unless they are currently in the rays.
@@ -97,65 +97,38 @@ class DroneSwarm2D(gym.Env):
         self.reset()
 
     def _raycast(self):
+        # Vectorised over drones, rays and circles; same geometry as the original per-ray loops.
         c = self.cfg
-        readings = np.full((self.n, c.num_rays), c.vision_range, dtype=np.float32)
+        pos = self.positions.astype(np.float64)
+        angles = self.headings.astype(np.float64)[:, None] + self.ray_offsets[None, :]
+        d = np.stack([np.cos(angles), np.sin(angles)], axis=-1)  # (n, R, 2)
+        min_t = np.full(angles.shape, c.vision_range, dtype=np.float64)
 
-        for i in range(self.n):
-            px, py = self.positions[i]
-            angles = self.headings[i] + self.ray_offsets
-            dx = np.cos(angles)
-            dy = np.sin(angles)
+        for axis in range(2):
+            da = d[..., axis]
+            pa = pos[:, axis:axis + 1]
+            safe = np.where(np.abs(da) > 1e-6, da, 1.0)
+            wall = np.where(da > 1e-6, c.world_size - c.drone_radius, c.drone_radius)
+            t = np.where(np.abs(da) > 1e-6, (wall - pa) / safe, np.inf)
+            min_t = np.where((t > 0.0) & (t < min_t), t, min_t)
 
-            for r in range(c.num_rays):
-                rx, ry = dx[r], dy[r]
-                min_t = c.vision_range
+        def circle_hits(centers, combined_r, exclude_self=False):
+            f = pos[:, None, :] - centers[None, :, :]  # (n, M, 2)
+            b = 2.0 * np.einsum("nrk,nmk->nrm", d, f)
+            c_val = (f * f).sum(-1) - combined_r * combined_r  # (n, M)
+            disc = b * b - 4.0 * c_val[:, None, :]
+            t = (-b - np.sqrt(np.maximum(disc, 0.0))) / 2.0
+            valid = (disc >= 0.0) & (t > 0.0)
+            if exclude_self:
+                valid &= ~np.eye(self.n, dtype=bool)[:, None, :]
+            return np.where(valid, t, np.inf).min(axis=2)
 
-                if rx > 1e-6:
-                    t = (c.world_size - c.drone_radius - px) / rx
-                    if 0.0 < t < min_t:
-                        min_t = t
-                elif rx < -1e-6:
-                    t = (c.drone_radius - px) / rx
-                    if 0.0 < t < min_t:
-                        min_t = t
+        if len(self.obstacles):
+            obs = self.obstacles.astype(np.float64)
+            min_t = np.minimum(min_t, circle_hits(obs[:, :2], obs[None, :, 2] + c.drone_radius))
+        min_t = np.minimum(min_t, circle_hits(pos, 2.0 * c.drone_radius, exclude_self=True))
 
-                if ry > 1e-6:
-                    t = (c.world_size - c.drone_radius - py) / ry
-                    if 0.0 < t < min_t:
-                        min_t = t
-                elif ry < -1e-6:
-                    t = (c.drone_radius - py) / ry
-                    if 0.0 < t < min_t:
-                        min_t = t
-
-                for ox, oy, rad in self.obstacles:
-                    fx, fy = px - ox, py - oy
-                    combined_r = rad + c.drone_radius
-                    b = 2.0 * (fx * rx + fy * ry)
-                    c_val = fx * fx + fy * fy - combined_r * combined_r
-                    disc = b * b - 4.0 * c_val
-                    if disc >= 0.0:
-                        t = (-b - np.sqrt(disc)) / 2.0
-                        if 0.0 < t < min_t:
-                            min_t = t
-
-                for j in range(self.n):
-                    if i == j:
-                        continue
-                    ox, oy = self.positions[j]
-                    fx, fy = px - ox, py - oy
-                    combined_r = 2.0 * c.drone_radius
-                    b = 2.0 * (fx * rx + fy * ry)
-                    c_val = fx * fx + fy * fy - combined_r * combined_r
-                    disc = b * b - 4.0 * c_val
-                    if disc >= 0.0:
-                        t = (-b - np.sqrt(disc)) / 2.0
-                        if 0.0 < t < min_t:
-                            min_t = t
-
-                readings[i, r] = min_t
-
-        return readings / c.vision_range
+        return (min_t / c.vision_range).astype(np.float32)
 
     def _cohesion_excess(self):
         # How far each drone is outside cohesion_radius from the swarm centroid.
@@ -223,7 +196,7 @@ class DroneSwarm2D(gym.Env):
                 self.positions / c.world_size,
                 self.velocities / c.max_speed,
                 to_target,
-                np.clip(rel, -3.0, 3.0),
+                np.clip(rel, -3.0, 3.0) / 3.0,
                 rays,
             ],
             axis=1,
@@ -276,8 +249,9 @@ class DroneSwarm2D(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         center, self.target = self._sample_start_and_target()
-        # Drones start evenly spaced on a circle of radius start_spread, with a random rotation.
-        phase = float(self.np_random.uniform(0.0, 2 * np.pi))
+        # Drones start evenly spaced on a circle of radius start_spread; rotated randomly only when the start is random,
+        # so a fixed start gives every drone the same slot each episode.
+        phase = float(self.np_random.uniform(0.0, 2 * np.pi)) if self.cfg.random_start else 0.0
         angles = phase + 2 * np.pi * np.arange(self.n) / self.n
         c_spread = self.cfg.start_spread * np.stack([np.cos(angles), np.sin(angles)], axis=1)
         self.positions = (center + c_spread).astype(np.float32)
@@ -288,6 +262,10 @@ class DroneSwarm2D(gym.Env):
         self.searched = np.zeros(len(self.cell_centers), dtype=bool)
         self.target_found = False
         self._update_search()
+        if self.target_found:
+            # Rays follow the heading, so point it at the known target instead of a random direction.
+            to_target = self.target - self.positions
+            self.headings = np.arctan2(to_target[:, 1], to_target[:, 0]).astype(np.float32)
         return self._observation(), {}
 
     def _geometry(self):
@@ -345,7 +323,11 @@ class DroneSwarm2D(gym.Env):
         was_found = self.target_found
         newly_searched = self._update_search()
         target_dist, pair, nearest, obs_clear, wall_clear = self._geometry()
-        progress = float(np.mean(old_dist - target_dist)) if self.target_found else 0.0
+        # Success needs every drone at the target, so weight the farthest drone's progress as well as the mean.
+        if self.target_found:
+            progress = 0.5 * float(np.mean(old_dist - target_dist)) + 0.5 * float(old_dist.max() - target_dist.max())
+        else:
+            progress = 0.0
         cohesion_excess = self._cohesion_excess()
         cohesion_error = float(cohesion_excess.mean())
 

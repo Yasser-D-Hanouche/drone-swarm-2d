@@ -78,8 +78,8 @@ class RewardConfig:
 @dataclass
 class PPOConfig:
     learning_rate: float = 3e-4
-    n_envs: int = 1                    # parallel environments (separate processes if > 1); n_steps below is per environment
-    n_steps: int = 1024                # rollout length per environment per update
+    n_envs: int = 2                    # parallel environments (separate processes if > 1); n_steps below is per environment
+    n_steps: int = 512                 # rollout length per environment per update; n_envs * n_steps = samples per update (keep 1024)
     batch_size: int = 64               # must not exceed n_steps; ideally divides n_steps * n_envs
     n_epochs: int = 10
     gamma: float = 0.99                # discount; 0.99 looks ~100 steps (10 s) ahead
@@ -88,6 +88,7 @@ class PPOConfig:
     ent_coef: float = 0.0              # raise (e.g. 0.005) if the policy stops exploring too early
     log_std_init: float = -1.0         # initial action noise = exp(value); SB3 default 0 (std 1.0) drowns a [-1, 1] action range
     net_arch: list = field(default_factory=lambda: [64, 64])  # hidden layer sizes; try [128, 128] for the larger observation
+    normalize_reward: bool = True      # divide rewards by a running std during training only; reported returns stay raw
 
 
 @dataclass
@@ -97,7 +98,7 @@ class RunConfig:
     seed: int = 42
     timesteps: int = 100_000           # total training steps over all environments
     eval_episodes: int = 30            # final evaluation episodes (same seeds for every policy)
-    eval_freq: int = 5_000             # periodic evaluation during training; 0 disables
+    eval_freq: int = 50_000            # periodic evaluation during training; 0 disables
     periodic_eval_episodes: int = 10
     gif: bool = True
 
