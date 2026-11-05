@@ -78,7 +78,7 @@ class RewardConfig:
 @dataclass
 class PPOConfig:
     learning_rate: float = 3e-4
-    n_envs: int = 2                    # parallel environments (separate processes if > 1); n_steps below is per environment
+    n_envs: int = 4                    # parallel environments (separate processes if > 1); n_steps below is per environment
     n_steps: int = 512                 # rollout length per environment per update; n_envs * n_steps = environment steps per update (keep 1024)
     batch_size: int = 192              # minibatch of drone samples; one update holds n_steps * n_envs * num_drones samples (3072 by default)
     n_epochs: int = 10
