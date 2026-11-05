@@ -36,6 +36,7 @@ class EnvConfig:
     start_spread: float = 0.5          # drones start evenly spaced on a circle of this radius around the start centre
     success_radius: float = 0.8        # success = every drone within this distance of the target
     cohesion_radius: float = 1.0       # max distance from the swarm centroid before the cohesion penalty applies
+    search_cohesion_radius: float = 2.0  # same limit while the target is still hidden, so drones can spread out
 
     # --- target search (the target is hidden from the policy until found) ---
     target_sense_range: float = 1.5    # a drone detects the target, and marks map cells searched, within this distance
@@ -59,7 +60,7 @@ class EnvConfig:
 @dataclass
 class RewardConfig:
     # Per-step terms; the success/collision terms are paid once because the episode ends.
-    target_found_bonus = 10.0
+    target_found_bonus: float = 70.0   # + once, on first detection; above the exploration a full map can yield (about 67)
     search_waypoint_weight: float = 1.0
 
     wall_weight: float = 3.0
@@ -67,7 +68,7 @@ class RewardConfig:
     progress_weight: float = 2.0       # + weight * mean decrease in distance to the target per step (only once found)
     explore_weight: float = 2.0        # + weight per map cell searched for the first time (only until the target is found)
     cohesion_weight: float = 0.5       # - weight * mean(max(0, distance to centroid - env.cohesion_radius)) per step
-    formation_weight: float = 0.75
+    formation_weight: float = 0.75     # - weight * formation error per step; applied only once the target is found
     separation_weight: float = 1.0     # - weight * mean(max(0, margin - gap to nearest drone) / margin) per step
     separation_margin: float = 0.3     # gap (m, surface to surface) below which drones are penalised; 0 disables
     obstacle_weight: float = 1.0       # - weight * mean(max(0, margin - clearance) / margin) per step
@@ -238,6 +239,8 @@ def validate(cfg: Config) -> None:
         raise ValueError("env.target_sense_range and env.explore_cell must be positive")
     if e.target_sense_range < e.success_radius:
         raise ValueError("env.target_sense_range must be >= env.success_radius")
+    if e.target_sense_range <= e.explore_cell * math.sqrt(2) / 2:
+        raise ValueError("env.target_sense_range must exceed half the cell diagonal (explore_cell * sqrt(2) / 2)")
 
     spacing = 2 * e.start_spread * math.sin(math.pi / e.num_drones)
     if spacing <= 2 * e.drone_radius:

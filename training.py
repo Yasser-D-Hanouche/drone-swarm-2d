@@ -133,7 +133,7 @@ def train(cfg: Config, run_dir: Path, console: bool = True):
         ent_coef=p.ent_coef,
         policy_kwargs={"net_arch": list(p.net_arch), "log_std_init": p.log_std_init},
         seed=cfg.run.seed,
-        device="cuda",
+        device="auto",
         verbose=0,
     )
     model.set_logger(configure(str(run_dir / "sb3_log"), _log_formats()))

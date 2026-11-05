@@ -139,9 +139,10 @@ class DroneSwarm2D(gym.Env):
         return (min_t / c.vision_range).astype(np.float32)
 
     def _cohesion_excess(self):
-        # How far each drone is outside cohesion_radius from the swarm centroid.
+        # Looser limit while the target is hidden, so drones can spread out to search.
+        radius = self.cfg.cohesion_radius if self.target_found else self.cfg.search_cohesion_radius
         dist = np.linalg.norm(self.positions - self.positions.mean(axis=0), axis=1)
-        return np.maximum(dist - self.cfg.cohesion_radius, 0.0)
+        return np.maximum(dist - radius, 0.0)
 
     def _formation_errors(self):
         """
@@ -163,7 +164,9 @@ class DroneSwarm2D(gym.Env):
         # Returns per drone the number of cells it searched for the first time (shared if several drones are first); may flip target_found.
         c = self.cfg
         d = np.linalg.norm(self.positions[:, None, :] - self.cell_centers[None, :, :], axis=2)
-        seen = d <= c.target_sense_range
+        # Shrunk by half a cell diagonal: a fully searched map then implies the target was detected.
+        cell_reach = c.target_sense_range - c.explore_cell * np.sqrt(2) / 2
+        seen = d <= cell_reach
         fresh = seen & ~self.searched[None, :]
         newly = (fresh / np.maximum(fresh.sum(axis=0, keepdims=True), 1)).sum(axis=1)
         self.searched |= seen.any(axis=0)
@@ -422,7 +425,7 @@ class DroneSwarm2D(gym.Env):
             )
         just_found = not was_found and self.target_found
         target_dist, pair, nearest, obs_clear, wall_clear = self._geometry()
-        # Success needs every drone at the target, so weight the farthest drone's progress as well as the mean.
+        # Mean per-drone progress only; there is no worst-drone blend.
         if self.target_found:
             progress = old_dist - target_dist
         else:
@@ -459,7 +462,8 @@ class DroneSwarm2D(gym.Env):
         terms = {k: np.zeros(self.n) for k in REWARD_TERMS}
         terms["progress"] = w.progress_weight * progress
         terms["cohesion"] = -w.cohesion_weight * cohesion_excess
-        terms["formation"] = -w.formation_weight * formation_errors
+        if self.target_found:
+            terms["formation"] = -w.formation_weight * formation_errors
         terms["step"] = np.full(self.n, -w.step_penalty)
         if not was_found:
             terms["exploration"] = w.explore_weight * newly_searched
