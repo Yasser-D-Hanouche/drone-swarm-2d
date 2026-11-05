@@ -59,13 +59,15 @@ class EnvConfig:
 @dataclass
 class RewardConfig:
     # Per-step terms; the success/collision terms are paid once because the episode ends.
+    target_found_bonus = 10.0
+    search_waypoint_weight: float = 1.0
 
     wall_weight: float = 3.0
     wall_margin: float = 1.0
     progress_weight: float = 2.0       # + weight * mean decrease in distance to the target per step (only once found)
-    explore_weight: float = 0.2        # + weight per map cell searched for the first time (only until the target is found)
+    explore_weight: float = 2.0        # + weight per map cell searched for the first time (only until the target is found)
     cohesion_weight: float = 0.5       # - weight * mean(max(0, distance to centroid - env.cohesion_radius)) per step
-    formation_weight: float = 0.5
+    formation_weight: float = 0.75
     separation_weight: float = 1.0     # - weight * mean(max(0, margin - gap to nearest drone) / margin) per step
     separation_margin: float = 0.3     # gap (m, surface to surface) below which drones are penalised; 0 disables
     obstacle_weight: float = 1.0       # - weight * mean(max(0, margin - clearance) / margin) per step
@@ -79,13 +81,13 @@ class RewardConfig:
 class PPOConfig:
     learning_rate: float = 3e-4
     n_envs: int = 4                    # parallel environments (separate processes if > 1); n_steps below is per environment
-    n_steps: int = 512                 # rollout length per environment per update; n_envs * n_steps = environment steps per update (keep 1024)
+    n_steps: int = 256                 # rollout length per environment per update; n_envs * n_steps = environment steps per update (keep 1024)
     batch_size: int = 192              # minibatch of drone samples; one update holds n_steps * n_envs * num_drones samples (3072 by default)
     n_epochs: int = 10
     gamma: float = 0.99                # discount; 0.99 looks ~100 steps (10 s) ahead
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    ent_coef: float = 0.0              # raise (e.g. 0.005) if the policy stops exploring too early
+    ent_coef: float = 0.005            # raise (e.g. 0.005) if the policy stops exploring too early
     log_std_init: float = -1.0         # initial action noise = exp(value); SB3 default 0 (std 1.0) drowns a [-1, 1] action range
     net_arch: list = field(default_factory=lambda: [64, 64])  # hidden layer sizes; try [128, 128] for the larger observation
     normalize_reward: bool = True      # divide rewards by a running std during training only; reported returns stay raw

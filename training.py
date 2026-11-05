@@ -133,12 +133,16 @@ def train(cfg: Config, run_dir: Path, console: bool = True):
         ent_coef=p.ent_coef,
         policy_kwargs={"net_arch": list(p.net_arch), "log_std_init": p.log_std_init},
         seed=cfg.run.seed,
-        device="cpu",
+        device="cuda",
         verbose=0,
     )
     model.set_logger(configure(str(run_dir / "sb3_log"), _log_formats()))
     monitor = TrainingMonitor(cfg, console=console)
     model.learn(total_timesteps=cfg.run.timesteps * cfg.env.num_drones, callback=monitor)
     model.save(str(run_dir / "model"))
+    if isinstance(env, VecNormalize):
+        vecnormalize_path = run_dir / "vecnormalize.pkl"
+        env.save(str(vecnormalize_path))
+        print(f"Saved VecNormalize statistics: {vecnormalize_path}")
     env.close()
     return model, monitor

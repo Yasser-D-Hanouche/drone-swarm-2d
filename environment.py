@@ -13,10 +13,12 @@ from config import EnvConfig, RewardConfig
 REWARD_TERMS = [
     "progress",
     "exploration",
+    "search_waypoint",
     "cohesion",
     "formation",
     "separation",
     "step",
+    "target_found",
     "obstacle_proximity",
     "wall_proximity",
     "collision",
@@ -96,7 +98,7 @@ class DroneSwarm2D(gym.Env):
         gx, gy = np.meshgrid(axis, axis, indexing="ij")
         self.cell_centers = np.stack([gx.ravel(), gy.ravel()], axis=1).astype(np.float32)
 
-        obs_dim = 13 + 2 * (self.n - 1) + self.cfg.num_rays + len(self.cell_centers)
+        obs_dim = 15 + 2 * (self.n - 1) + self.cfg.num_rays + len(self.cell_centers)
         self.action_space = spaces.Box(-1.0, 1.0, shape=(self.n, 2), dtype=np.float32)
         self.observation_space = spaces.Box(-np.inf, np.inf, shape=(self.n, obs_dim), dtype=np.float32)
         self.frame_angle = np.zeros(self.n, dtype=np.float32)
@@ -171,6 +173,36 @@ class DroneSwarm2D(gym.Env):
             self.frame_angle = np.arctan2(to[:, 1], to[:, 0]).astype(np.float32)
         return newly
 
+    def _refresh_search_goal(self):
+        """Keep the current waypoint until its cell is searched."""
+        if self.target_found:
+            self.search_goal_idx = None
+            return
+
+        # Keep the active waypoint while its cell remains unsearched.
+        if (
+            self.search_goal_idx is not None
+            and not self.searched[self.search_goal_idx]
+        ):
+            return
+
+        unsearched = np.flatnonzero(~self.searched)
+
+        if len(unsearched) == 0:
+            self.search_goal_idx = None
+            return
+
+        centroid = self.positions.mean(axis=0)
+
+        distances = np.linalg.norm(
+            self.cell_centers[unsearched] - centroid,
+            axis=1
+        )
+
+        self.search_goal_idx = int(
+            unsearched[np.argmin(distances)]
+        )
+
     def _rot(self):
         # (n, 2, 2): per-drone rotation from its own frame to world axes.
         c, s = np.cos(self.frame_angle), np.sin(self.frame_angle)
@@ -203,6 +235,17 @@ class DroneSwarm2D(gym.Env):
             to_target = self.to_frame((self.target - self.positions) / c.world_size)
         else:
             to_target = np.zeros((n, 2), dtype=np.float32)
+        
+        if self.target_found or self.search_goal_idx is None:
+            search_goal_vector = np.zeros(
+                (n, 2), dtype=np.float32
+            )
+        else:
+            search_goal = self.cell_centers[self.search_goal_idx]
+
+            search_goal_vector = self.to_frame(
+                (search_goal - self.positions) / c.world_size
+            )
 
         diff = self.positions[None, :, :] - self.positions[:, None, :]  # [i, j] = pos_j - pos_i
         dist = np.linalg.norm(diff, axis=2)
@@ -223,6 +266,7 @@ class DroneSwarm2D(gym.Env):
             [
                 self.to_frame(self.velocities / c.max_speed),
                 to_target,
+                search_goal_vector,
                 rel,
                 np.stack([np.cos(heading), np.sin(heading)], axis=1),
                 self._raycast(),
@@ -293,7 +337,11 @@ class DroneSwarm2D(gym.Env):
         self.searched = np.zeros(len(self.cell_centers), dtype=bool)
         self.target_found = False
         self.frame_angle = np.zeros(self.n, dtype=np.float32)
+
+        self.search_goal_idx = None
+
         self._update_search()
+        self._refresh_search_goal()
         if self.target_found:
             # Rays follow the heading, so point it at the known target instead of a random direction.
             to_target = self.target - self.positions
@@ -333,6 +381,18 @@ class DroneSwarm2D(gym.Env):
         actions = shared_action + c.action_residual_scale * (actions - shared_action)
 
         old_dist = np.linalg.norm(self.positions - self.target, axis=1)
+        # Store the active waypoint before moving.
+        old_search_goal = None
+        old_search_goal_distance = None
+
+        if not self.target_found and self.search_goal_idx is not None:
+            old_search_goal = self.cell_centers[self.search_goal_idx].copy()
+
+            old_centroid = self.positions.mean(axis=0)
+
+            old_search_goal_distance = float(
+                np.linalg.norm(old_centroid - old_search_goal)
+            )
 
         self.velocities += actions * c.max_accel * c.dt
         speeds = np.linalg.norm(self.velocities, axis=1, keepdims=True)
@@ -347,6 +407,20 @@ class DroneSwarm2D(gym.Env):
 
         was_found = self.target_found
         newly_searched = self._update_search()
+        # Reward movement towards the active search waypoint.
+        search_waypoint_progress = 0.0
+
+        if not was_found and old_search_goal is not None:
+            new_centroid = self.positions.mean(axis=0)
+
+            new_distance = np.linalg.norm(
+                new_centroid - old_search_goal
+            )
+
+            search_waypoint_progress = (
+                old_search_goal_distance - new_distance
+            )
+        just_found = not was_found and self.target_found
         target_dist, pair, nearest, obs_clear, wall_clear = self._geometry()
         # Success needs every drone at the target, so weight the farthest drone's progress as well as the mean.
         if self.target_found:
@@ -389,6 +463,18 @@ class DroneSwarm2D(gym.Env):
         terms["step"] = np.full(self.n, -w.step_penalty)
         if not was_found:
             terms["exploration"] = w.explore_weight * newly_searched
+
+            terms["search_waypoint"] = np.full(
+                self.n,
+                w.search_waypoint_weight * search_waypoint_progress,
+                dtype=np.float32
+            )
+        if just_found:
+            terms["target_found"] = np.full(
+            self.n,
+            w.target_found_bonus,
+            dtype=np.float32
+            )
         if w.separation_margin > 0:
             gap = nearest - 2 * c.drone_radius
             close = np.maximum(0.0, w.separation_margin - gap) / w.separation_margin
@@ -400,9 +486,14 @@ class DroneSwarm2D(gym.Env):
             wall_proximity = np.maximum(0.0, w.wall_margin - wall_clear) / w.wall_margin
             terms["wall_proximity"] = -w.wall_weight * wall_proximity
         if collision:
-            terms["collision"] = -w.collision_penalty * culprits
+            terms["collision"] = np.full(
+                self.n,
+                -w.collision_penalty,
+                dtype=np.float32
+            )
         if success:
             terms["success"] = np.full(self.n, w.success_bonus)  # all drones are at the target, so all share the bonus
+        self._refresh_search_goal()
         drone_rewards = np.sum(list(terms.values()), axis=0)
         reward = float(drone_rewards.mean())
 
