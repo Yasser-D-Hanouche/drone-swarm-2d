@@ -119,6 +119,15 @@ class Config:
 # run.timesteps are rough starting budgets: adjust them from eval_curve.csv / training_curves.png.
 _NO_OBSTACLES = {"env.min_obstacles": 0, "env.max_obstacles": 0}
 _KNOWN_TARGET = {"env.target_sense_range": 20.0}  # larger than the world: the target is found at step 0
+# Search stages: with the default weights exploring earns ~0.01 per step while formation costs ~0.1, and a crash (-10)
+# is no worse than hovering, so the swarm parks in the middle and never searches (run 20261111_144649_3_search).
+_SEARCH = {
+    "reward.explore_weight": 1.0,       # a sweep now pays ~0.1 per drone per step, clearly above the per-step costs
+    "reward.formation_weight": 0.1,     # keep the formation a preference, not the dominant term
+    "reward.collision_penalty": 50.0,   # crashing must always be worse than surviving until the time limit
+    "ppo.gamma": 0.995,                 # ~200-step horizon: a search takes several hundred steps
+    "ppo.net_arch": [128, 128],         # the observation includes the 100-cell searched map
+}
 STAGES: dict[str, dict] = {
     "1_known_fixed": {  # one fixed layout, target known, no obstacles: proves the setup works at all
         **_NO_OBSTACLES, **_KNOWN_TARGET,
@@ -128,12 +137,12 @@ STAGES: dict[str, dict] = {
         **_NO_OBSTACLES, **_KNOWN_TARGET, "run.timesteps": 500_000,
     },
     "3_search": {  # target hidden: the swarm must explore
-        **_NO_OBSTACLES, "run.timesteps": 1_000_000,
+        **_NO_OBSTACLES, **_SEARCH, "run.timesteps": 1_000_000,
     },
     "4_search_few_obstacles": {  # search plus 1-2 random obstacles
-        "env.min_obstacles": 1, "env.max_obstacles": 2, "run.timesteps": 1_000_000,
+        **_SEARCH, "env.min_obstacles": 1, "env.max_obstacles": 2, "run.timesteps": 1_000_000,
     },
-    "5_full": {"run.timesteps": 3_000_000},  # defaults: hidden target, 3-5 random obstacles, everything random
+    "5_full": {**_SEARCH, "run.timesteps": 3_000_000},  # hidden target, 3-5 random obstacles, everything random
 }
 
 
