@@ -119,14 +119,18 @@ class Config:
 # run.timesteps are rough starting budgets: adjust them from eval_curve.csv / training_curves.png.
 _NO_OBSTACLES = {"env.min_obstacles": 0, "env.max_obstacles": 0}
 _KNOWN_TARGET = {"env.target_sense_range": 20.0}  # larger than the world: the target is found at step 0
-# Search stages: with the default weights exploring earns ~0.01 per step while formation costs ~0.1, and a crash (-10)
-# is no worse than hovering, so the swarm parks in the middle and never searches (run 20261111_144649_3_search).
+# Search stages: settings of the best stage 3 run so far (20261111_154350_3_search, 47% success, target found 53%).
+# Letting the swarm spread out (cohesion_radius 3) and paying more for exploring and progress made it search;
+# the default weights left it parked mid-arena. A five-parameter rebalance (explore 1, formation 0.1, collision 50,
+# gamma 0.995, 128x128, max_speed 1) scored 3% (run 20261111_165305), so change one value at a time from here.
 _SEARCH = {
-    "reward.explore_weight": 1.0,       # a sweep now pays ~0.1 per drone per step, clearly above the per-step costs
-    "reward.formation_weight": 0.1,     # keep the formation a preference, not the dominant term
-    "reward.collision_penalty": 50.0,   # crashing must always be worse than surviving until the time limit
-    "ppo.gamma": 0.995,                 # ~200-step horizon: a search takes several hundred steps
-    "ppo.net_arch": [128, 128],         # the observation includes the 100-cell searched map
+    "env.cohesion_radius": 3.0,
+    "env.max_speed": 0.5,
+    "reward.explore_weight": 0.8,
+    "reward.progress_weight": 5.0,
+    "reward.separation_weight": 0.5,
+    "reward.separation_margin": 0.2,
+    "ppo.n_envs": 4,
 }
 STAGES: dict[str, dict] = {
     "1_known_fixed": {  # one fixed layout, target known, no obstacles: proves the setup works at all
