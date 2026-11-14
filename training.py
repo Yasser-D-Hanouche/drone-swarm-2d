@@ -133,9 +133,10 @@ def train(cfg: Config, run_dir: Path, console: bool = True):
         ent_coef=p.ent_coef,
         policy_kwargs={"net_arch": list(p.net_arch), "log_std_init": p.log_std_init},
         seed=cfg.run.seed,
-        device="auto",
+        device=p.device,
         verbose=0,
     )
+    print(f"PPO network on device: {model.device}  (torch {torch.__version__}, CUDA build {torch.version.cuda})")
     model.set_logger(configure(str(run_dir / "sb3_log"), _log_formats()))
     monitor = TrainingMonitor(cfg, console=console)
     model.learn(total_timesteps=cfg.run.timesteps * cfg.env.num_drones, callback=monitor)

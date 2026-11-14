@@ -8,6 +8,7 @@ Commit history: this workspace has no `.git` folder, so per-commit hashes are no
 
 - [2026-10-31: Handoff and Stage 1 experiments](#2026-10-31-handoff-and-stage-1-experiments)
 - [2026-11-05: Stage 3 review, fixes, and documentation restructure](#2026-11-05-stage-3-review-fixes-and-documentation-restructure)
+- [2026-11-14: GPU environment](#2026-11-14-gpu-environment)
 
 ---
 
@@ -247,3 +248,84 @@ Problems identified:
 2. Check `r_formation`, `r_exploration`, `r_target_found`, `r_collision`, and the outcome table in `report.md`.
 3. Decide the collision-penalty scope and the defaults questions above.
 4. Record each Stage 3 run as a new entry in this file.
+
+---
+
+## 2026-11-14: GPU environment
+
+Working branch: `martin-branch`.
+
+### 2026-11-14.1 Findings
+
+- `.venv` holds `torch 2.15.0+cpu`, a build without CUDA, so it can never use a GPU. A separate venv is required.
+- `.venv` was created as `.venv-cpu` and later renamed. Its `bin/pip` launcher still points to `.venv-cpu/bin/python`, which no longer exists, so a bare `pip` fails. Use `python -m pip` in that venv. Not changed.
+- The default PyPI `torch 2.15.0` wheel is built for CUDA 13.2 and bundles the CUDA runtime as `nvidia-*` packages. wICE nodes run NVIDIA driver 615.71, which supports CUDA 13.
+- CUDA 13 dropped support for Pascal (P100) and Volta (V100). Usable: wICE A100 (`gpu_a100`, `gpu_a100_debug`, `interactive`) and H100 (`gpu_h100`); mindwell B200 (`gpu_b200`) and RTX 5000 Ada (`interactive`).
+- `$VSC_HOME` is 3 GB. The CUDA wheels are several GB, so pip's cache goes to `$VSC_SCRATCH/pip-cache`.
+- `metadata.json` was overwritten at the end of each run with only status fields, which dropped `python` and `command`.
+
+### 2026-11-14.2 Changes
+
+| File | Change | Reason |
+|---|---|---|
+| `cluster/setup_gpu_venv.sh` | New. Builds `.venv-gpu` with `torch==2.15.0` (CUDA 13.2) and the same pinned versions as `.venv` | Reproducible GPU environment |
+| `cluster/train_gpu.slurm` | New. One-GPU A100 batch job that passes its arguments to `run_experiment.py` and sets `ppo.device=cuda` | Batch GPU training |
+| `config.py` | `PPOConfig.device: str = "auto"`, validated as `auto`, `cpu` or `cuda[:i]` | Device is now an explicit, recorded choice; replaces the hard-coded `"auto"` in `training.py` |
+| `training.py` | Passes `ppo.device` to PPO and prints the device in use | Shows where the network runs |
+| `run_experiment.py` | `metadata.json` gains a `hardware` block (host, Slurm job, venv, torch build, GPU name); end-of-run updates merge instead of overwrite | CPU and GPU runs can be told apart; fixes lost metadata |
+| `.gitignore` | Adds `.venv*/` and `slurm-*.out` | Keep venvs and job logs out of git |
+| `README.md` | Device row, new files, section 10.1 on both venvs | Documentation |
+
+Training behaviour is unchanged: the default device is still `auto`.
+
+### 2026-11-14.3 Verification
+
+- Passed on CPU node k28i14 with `.venv-gpu`: `pip check`, `py_compile`, `--list-params`, and a 2,000-step Stage 1 smoke run (`runs/20261114_183348_gpu_env_smoke`). Without a GPU, `auto` falls back to CPU as intended. `ppo.device=gpu` is rejected before a run folder is created.
+- Not yet verified at the time: `torch.cuda.is_available()` on a GPU node, and a training run with `ppo.device=cuda`. Both were verified later the same day (2026-11-14.5).
+
+### 2026-11-14.4 Expected performance (to measure)
+
+The policy is a [64, 64] MLP, and most of the wall-clock time goes to stepping the environment in Python on CPU. Stable-Baselines3 documents that PPO with an MLP policy usually runs as fast or faster on CPU, because moving small batches to the GPU has overhead. The main gain from a GPU node may be its CPU cores (18 per A100), which allow a larger `ppo.n_envs`. Before moving all training to GPU nodes, time the same short run with `ppo.device=cpu` and `ppo.device=cuda` on the GPU node, and record both here.
+
+### 2026-11-14.5 Benchmark: CPU versus GPU device
+
+Stage 3, 50,000 timesteps, 3 evaluation episodes, default PPO settings (`n_envs=4`, `n_steps=256`, `[64, 64]`).
+
+| Run | Node | Venv | `ppo.device` | Wall time | User CPU time |
+|---|---|---|---|---|---|
+| `bench_cpu` | k28i14 (CPU) | `.venv` | `cpu` | 1 min 18 s | 38 s |
+| `bench_cuda` | l11i31 (mindwell `interactive`, RTX 5000 Ada) | `.venv-gpu` | `cuda` | 1 min 40 s | 46 s |
+
+- The GPU run was about 28% slower, as SB3's warning predicts for MLP policies. Each rollout step sends 12 observation rows to the GPU and the actions back to the CPU. Each gradient step processes 192 samples through a 64-wide network. Kernel-launch and transfer latency outweighs the computation.
+- Part of the gap is fixed startup cost: CUDA initialisation, loading the CUDA libraries from `/data`, and matplotlib/fontconfig rebuilding caches because the GPU session had no writable `$HOME/.cache`. `cluster/train_gpu.slurm` now sets `XDG_CACHE_HOME` and `MPLCONFIGDIR` on scratch.
+- Confounded: different clusters, CPU generations (icelake versus graniterapids) and torch builds. The GPU session was opened with `--cpus-per-task=1`, so 4 environment processes plus the PPO process shared one core. A same-node check (`ppo.device=cpu` on the GPU node) has not been run.
+- Correction: this table first listed l11i31 as an A100 node. `metadata.json` (`hardware.gpu_name`) shows an NVIDIA RTX 5000 Ada on the mindwell cluster.
+- Decision: train with `ppo.device=cpu`. Speed comes from more environment processes (`ppo.n_envs`) on more cores, not from the GPU. Keep `.venv-gpu` for larger networks or a batched environment.
+
+### 2026-11-14.6 Interactive core limit and CPU batch jobs
+
+- The interactive session (partition `interactive`) gives 2 cores, which the default `ppo.n_envs=4` already oversubscribes. The account `lp_deeplearning_gt_2026b` has no per-user core limit; the `batch` partition offers 72-core icelake nodes for up to 3 days.
+- Added `cluster/train_cpu.slurm`: 9 cores, `.venv`, `ppo.device=cpu`, `ppo.n_envs = cores - 1`, and `ppo.n_steps = 1024 / n_envs`, which keeps 1,024 environment steps per update as with the 4 × 256 defaults.
+- `sbatch --test-only` on 2026-11-14 estimated a start within about 20 minutes for the CPU job and the next afternoon for an A100 job.
+- Speed-up measured in 2026-11-14.7. Still open: shorter rollouts (`n_steps=128`) change GAE bootstrapping; check that learning curves match the 4 × 256 setting on one seed.
+
+### 2026-11-14.7 Batch-job throughput, progress tracking, GPU session details
+
+Training throughput, from the last row of each run's `sb3_log/progress.csv` (`time/total_timesteps / num_drones` divided by `time/time_elapsed`). This covers the training phase only; evaluation, plots and report come after.
+
+| Run | Where | Cores | `n_envs` × `n_steps` | Device | Env steps/s |
+|---|---|---|---|---|---|
+| `20261114_184159_bench_cpu` | wICE `interactive`, k28i14 (icelake) | 2 | 4 × 256 | cpu | 796 |
+| `20261114_183914_bench_cuda` | mindwell `interactive`, l11i31 (graniterapids, RTX 5000 Ada) | 1 requested | 4 × 256 | cuda | 627 |
+| `20261114_190757_search` | wICE `batch`, l33c22n3 (icelake), job 62693806 | 9 | 8 × 128 | cpu | 1,556 |
+
+- The 9-core batch job trains about 1.95 times faster than the 2-core interactive session. Scaling is sub-linear (8 environment processes against 4): the single PPO process does the gradient updates serially while the workers wait.
+- First batch job 62693337 (same command): `COMPLETED`, 11 min 33 s elapsed, 22 min 05 s total CPU time over 9 allocated cores, so about 21% average core utilisation over the whole job. The evaluation, diagnosis and plotting phases run in one process. Its run folder, `20261114_185431_search`, was removed and the job resubmitted as 62693806.
+- The account `lp_deeplearning_gt_2026b` (balance 729,668 credits on 2026-11-14) has no per-user limits in its QOS. The wICE `interactive` QOS caps a session at 8 CPUs and 1 GPU; the session in use was opened with 2. On mindwell, `interactive` has billing weight 0 for CPUs and RTX 5000 Ada GPUs, and a 16 h time limit.
+- The GPU session is opened from inside the wICE interactive job, so the shell holds `SLURM_JOB_ID` and related variables. `srun` would use them and try to start a step inside the current wICE job; they are removed with `env -u ...` before `srun --clusters=mindwell`. The exact command is in README 10.5.
+- `.venv-gpu` was built on an icelake node with the icelake build of the Python module and runs unchanged on the graniterapids mindwell node. `torch.cuda.is_available()` returned `True` there, with driver support for CUDA 13.2.
+- On the mindwell node, `$HOME/.cache` was not writable (matplotlib reported `/.cache`), so matplotlib and fontconfig rebuilt their caches in every process. Both Slurm scripts now set `XDG_CACHE_HOME` and `MPLCONFIGDIR` under `$VSC_SCRATCH`.
+- In the first batch job, `slurm-62693337.out` showed only the header lines during training: Python block-buffers stdout when it is not a terminal. Both Slurm scripts now run `python -u`.
+- Added `cluster/progress.py`, which reads `sb3_log/progress.csv` (written by SB3 after every update) and `config.json`, and reports environment steps (SB3 timesteps divided by `num_drones`), elapsed time, a linear estimate of the remaining time, last-rollout success and the latest periodic evaluation. Standard library only.
+- `run_experiment.py` prints run folders via `Path.resolve()`, which shows `/vsc-hard-mounts/leuven-data/...`. `/data/leuven` is a symbolic link to `/vsc-hard-mounts/leuven-data` (the same inode was confirmed), so there is one folder. Not changed.
+- README section 10 was restructured into 10.1 (venvs), 10.2 (interactive versus batch), 10.3 (batch jobs), 10.4 (progress tracking) and 10.5 (GPU).

@@ -43,6 +43,24 @@ def git_commit():
         return None
 
 
+def hardware_info():
+    """Where the run executed, so CPU and GPU runs can be told apart later."""
+    import os
+    import socket
+
+    import torch
+    gpu = torch.cuda.is_available()
+    return {
+        "host": socket.gethostname(),
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+        "virtual_env": os.environ.get("VIRTUAL_ENV"),
+        "torch": torch.__version__,
+        "torch_cuda_build": torch.version.cuda,
+        "cuda_available": gpu,
+        "gpu_name": torch.cuda.get_device_name(0) if gpu else None,
+    }
+
+
 def make_run_dir(name):
     safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
     run_dir = Path("runs") / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe}"
@@ -94,10 +112,11 @@ def main():
     run_dir = make_run_dir(cfg.run.name)
     commit = git_commit()
     save_json(run_dir / "config.json", cfg.to_dict())
-    save_json(run_dir / "metadata.json", {
+    metadata = {
         "status": "running", "started_at": datetime.now().astimezone().isoformat(),
-        "git_commit": commit, "python": sys.version, "command": sys.argv,
-    })
+        "git_commit": commit, "python": sys.version, "command": sys.argv, "hardware": hardware_info(),
+    }
+    save_json(run_dir / "metadata.json", metadata)
     for source in ("environment.py", "config.py"):
         shutil.copy2(source, run_dir / source)
 
@@ -151,14 +170,11 @@ def main():
             "summaries": summaries, "diagnosis": diagnosis, "eval_curve": monitor.eval_curve,
         })
         write_report(run_dir / "report.md", cfg, overrides, summaries, diagnosis, monitor.episodes, files)
-        save_json(run_dir / "metadata.json", {
-            "status": "completed", "completed_at": datetime.now().astimezone().isoformat(), "git_commit": commit,
-        })
+        metadata.update({"status": "completed", "completed_at": datetime.now().astimezone().isoformat()})
+        save_json(run_dir / "metadata.json", metadata)
     except Exception as error:
-        save_json(run_dir / "metadata.json", {
-            "status": "failed", "failed_at": datetime.now().astimezone().isoformat(), "error": repr(error),
-            "git_commit": commit,
-        })
+        metadata.update({"status": "failed", "failed_at": datetime.now().astimezone().isoformat(), "error": repr(error)})
+        save_json(run_dir / "metadata.json", metadata)
         raise
 
     print("\n" + "=" * 70)

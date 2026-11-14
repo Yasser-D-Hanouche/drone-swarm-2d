@@ -92,6 +92,7 @@ class PPOConfig:
     log_std_init: float = -1.0         # initial action noise = exp(value); SB3 default 0 (std 1.0) drowns a [-1, 1] action range
     net_arch: list = field(default_factory=lambda: [64, 64])  # hidden layer sizes; try [128, 128] for the larger observation
     normalize_reward: bool = True      # divide rewards by a running std during training only; reported returns stay raw
+    device: str = "auto"               # torch device for the network: "auto" (GPU if visible), "cpu", "cuda", "cuda:1"; env simulation always runs on CPU
 
 
 @dataclass
@@ -221,6 +222,8 @@ def validate(cfg: Config) -> None:
         raise ValueError("run.timesteps and run.eval_episodes must be positive")
     if p.n_envs < 1:
         raise ValueError("ppo.n_envs must be at least 1")
+    if p.device != "auto" and p.device != "cpu" and not p.device.startswith("cuda"):
+        raise ValueError('ppo.device must be "auto", "cpu", "cuda" or "cuda:<index>"')
     if p.batch_size > p.n_steps * p.n_envs * e.num_drones:
         raise ValueError("ppo.batch_size must not exceed ppo.n_steps * ppo.n_envs * env.num_drones")
     if r.obstacle_weight > 0 and r.obstacle_margin <= 0:
