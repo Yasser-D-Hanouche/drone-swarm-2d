@@ -144,6 +144,11 @@ def summarize(rows):
         "mean_searched_fraction": mean("searched_fraction"),
         "outcome_counts": {o: len(v) for o, v in by_outcome.items()},
         "outcome_rates": {o: len(v) / n for o, v in by_outcome.items()},
+        # Crashes split by phase: "search" = target not yet found, "approach" = after detection.
+        "crash_phase_counts": {
+            o: {"search": sum(not r["target_found"] for r in by_outcome[o]), "approach": sum(r["target_found"] for r in by_outcome[o])}
+            for o in ("obstacle", "boundary", "drone_collision")
+        },
         "mean_reward": float(rewards.mean()),
         "std_reward": float(rewards.std()),
         "mean_steps": mean("steps"),
@@ -417,6 +422,13 @@ def write_report(path, cfg: Config, overrides: dict, summaries: dict, diagnosis:
     lines += ["", "## How episodes end", "", "| Policy | " + " | ".join(OUTCOMES) + " |", "|---|" + "---|" * len(OUTCOMES)]
     for name, s in summaries.items():
         lines.append(f"| {name} | " + " | ".join(str(s["outcome_counts"][o]) for o in OUTCOMES) + " |")
+
+    crashes = ("obstacle", "boundary", "drone_collision")
+    lines += ["", "## Crashes by phase (search = before detection / approach = after)", "",
+              "| Policy | " + " | ".join(crashes) + " |", "|---|" + "---|" * len(crashes)]
+    for name, s in summaries.items():
+        phase = s["crash_phase_counts"]
+        lines.append(f"| {name} | " + " | ".join(f"{phase[o]['search']} / {phase[o]['approach']}" for o in crashes) + " |")
 
     ppo = summaries["PPO"]
     lines += ["", "## PPO return by outcome (mean summed reward terms)", "",

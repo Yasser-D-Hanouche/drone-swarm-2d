@@ -44,11 +44,13 @@ class EnvConfig:
     skip_targetless_cells: bool = True  # cells that cannot contain a random target (outside edge_margin) start as searched: no reward, never a waypoint
     waypoint_frame: bool = True        # while searching, the drones share a frame whose +x always points from the swarm centroid to the search waypoint; false = world axes
     observe_search_map: bool = True    # false hides the searched map and own position from the policy (zeros), leaving the waypoint as the only search guidance
+    skip_obstacle_cells: bool = True   # cells that random obstacles keep free of the target (obstacle_safe_margin) start as searched: never a waypoint inside or beside an obstacle
 
     # --- obstacle vision (rays point along each drone's velocity) ---
     num_rays: int = 7
     vision_angle: float = 120.0        # degrees covered by the rays
     vision_range: float = 2.0          # metres; stopping distance at max_speed is max_speed^2 / (2 * max_accel)
+    rays_see_drones: bool = True       # false: rays report only walls and obstacles (other drones are already in the observation as relative positions)
 
     # --- obstacles ---
     random_obstacles: bool = True      # new random obstacles every episode; false = use the fixed list below
@@ -141,7 +143,7 @@ STAGES: dict[str, dict] = {
         **_NO_OBSTACLES, **_SEARCH_TRAINING, "run.timesteps": 2_000_000,  # 1M left one seed in five at 62%; 2M gave 93-95% on three
     },
     "4_search_few_obstacles": {  # search plus 1-2 random obstacles
-        **_SEARCH_TRAINING, "env.min_obstacles": 1, "env.max_obstacles": 2, "run.timesteps": 1_000_000,
+        **_SEARCH_TRAINING, "env.min_obstacles": 1, "env.max_obstacles": 2, "run.timesteps": 2_000_000,  # Stage 3 needed 2M; obstacles add to it
     },
     "5_full": {**_SEARCH_TRAINING, "run.timesteps": 3_000_000},  # defaults: hidden target, 3-5 random obstacles, everything random
 }

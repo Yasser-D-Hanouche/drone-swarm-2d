@@ -80,6 +80,7 @@ An optional coupling blends each drone's action toward the swarm mean: $a_i' = \
 - A drone detects the target within `target_sense_range` (1.5 m). Once any drone detects it, the whole swarm knows its position.
 - The searched map has 10 × 10 cells of 1 m. A cell counts as searched when its centre is within about 0.79 m of a drone. That is the sensing range minus half a cell diagonal, so a fully searched map guarantees detection.
 - Cells that cannot contain the target start as searched (`env.skip_targetless_cells`). A random target lies at least `edge_margin` (1 m) from every wall, so the 36 border cells hold nothing to find. The 64 remaining cells have centres at least 1.5 m from a wall. Searching a border cell would mean flying inside the wall-penalty zone (LOG 2026-11-14.9).
+- Cells around random obstacles also start as searched (`env.skip_obstacle_cells`). A random target lies at least obstacle radius + `success_radius` + `obstacle_safe_margin` (r + 1.4 m) from each obstacle centre. A cell whose part inside the target area lies entirely within that distance of one obstacle holds nothing to find. This removes about 7 of the 64 cells per episode with 1 to 2 obstacles, and about 17 with 3 to 5. Without it the waypoint led the swarm into the obstacles (LOG 2026-11-14.21). The test is exact for one obstacle; a cell covered only jointly by two obstacles stays searchable, so a fully searched map still guarantees detection. It also means the searched map shows where the obstacles are from the first step.
 - The search waypoint is the unsearched cell nearest the swarm centroid. It is kept until that cell is searched.
 - Before detection, the observation contains the searched map and each drone's vector to the waypoint.
 - Stages 1 and 2 set the sensing range to 20 m, so the target is known from the start.
@@ -88,7 +89,8 @@ An optional coupling blends each drone's action toward the swarm mean: $a_i' = \
 
 - The full task uses 3 to 5 random circular obstacles with radii 0.5 to 0.9 m, kept `obstacle_safe_margin` away from the start drones and the target.
 - Touching an obstacle, a wall, or another drone ends the episode as a collision.
-- Stage presets 1 to 3 disable obstacles. Walls are always active.
+- Stage presets 1 to 3 disable obstacles; Stage 4 uses 1 to 2. Walls are always active.
+- The search waypoint is chosen by straight-line distance and the frame points straight at it, also through an obstacle. Steering around is left to the policy (rays and `obstacle_proximity`).
 
 ### 4.5 Success and termination
 
@@ -99,6 +101,8 @@ An optional coupling blends each drone's action toward the swarm mean: $a_i' = \
 ### 4.6 Vision and observation
 
 Each drone has 7 rays spanning 120°, reaching 2.0 m, pointing along its velocity direction. A ray reports the nearest obstacle, wall, or drone, without identifying which.
+
+`env.rays_see_drones=false` makes the rays ignore other drones. In formation flight about 86% of ray hits are teammates, so the switch was tested in Stage 4. It lowered success and raised drone collisions: the rays are also the policy's close-range sensor for its neighbours. The default stays `true` (LOG 2026-11-14.22).
 
 Each drone receives one observation row. For three drones the row has 126 values; in general $15 + 2(n-1) + \text{rays} + 100$.
 
@@ -176,21 +180,22 @@ Stages are presets in `config.STAGES`. Each stage trains from scratch; there is 
 | `1_known_fixed` | Navigation and coordination in a fixed layout | Known, fixed | None | 300k |
 | `2_known_random` | Random start and target | Known | None | 500k |
 | `3_search` | Exploration with a hidden target | Hidden | None | 2M |
-| `4_search_few_obstacles` | Search with 1 to 2 obstacles | Hidden | 1 to 2 | 1M |
+| `4_search_few_obstacles` | Search with 1 to 2 obstacles | Hidden | 1 to 2 | 2M |
 | `5_full` | Everything randomised | Hidden | 3 to 5 | 3M |
 
 Stages 3 to 5 also set `ppo.lr_schedule=linear`.
 
 Move to the next stage only after reliable performance across several training seeds. The proposed gate is about 80% success across at least three seeds.
 
-Status on 2026-11-14 (details in [LOG.md](LOG.md), entries 2026-11-14.8 to 2026-11-14.19):
+Status on 2026-11-14 (details in [LOG.md](LOG.md), entries 2026-11-14.8 to 2026-11-14.25):
 
 | Stage | Status |
 |---|---|
 | `1_known_fixed` | 100% on one seed (2026-11-05); not re-run since |
 | `2_known_random` | 100% on two seeds on 2026-11-05. On the current code two of three seeds fail (37% to 98%). Open issue, LOG 2026-11-14.15. |
 | `3_search` | 94%, 93% and 95% on three seeds at 2M steps. Passes the gate. |
-| `4_search_few_obstacles`, `5_full` | Not run with the current settings |
+| `4_search_few_obstacles` | 90% and 84% on two seeds at 2M steps (Greedy 92% and 93%). Above the 80% level; a third seed is needed for the gate. |
+| `5_full` | Not run with the current settings |
 
 ## 8. Running
 
@@ -215,7 +220,7 @@ Each run creates `runs/<timestamp>_<name>/`:
 
 | File | Content |
 |---|---|
-| `report.md` | Summary, outcomes, reward breakdown, automatic diagnosis (read first) |
+| `report.md` | Summary, outcomes, crashes by phase (search or approach), reward breakdown, automatic diagnosis (read first) |
 | `results.json` | Machine-readable summaries, confidence intervals, diagnosis |
 | `config.json` | Authoritative parameters used in the run |
 | `metadata.json` | Status, git commit, Python version, command |
@@ -308,6 +313,16 @@ Run folders are named by start time to the second. Two jobs with the same `--nam
 
 Options for `sbatch` go before the script name, for example `sbatch --cpus-per-task=17 --time=08:00:00 cluster/train_cpu.slurm ...`; `ppo.n_envs` and `ppo.n_steps` follow the core count automatically. `sbatch --test-only cluster/train_cpu.slurm ...` shows the estimated start time without submitting.
 
+More cores give diminishing returns. The PPO gradient update runs in one process and takes about 1 s per update whatever the core count; only the environment stepping is parallel. Stage 4, 200k-step benchmark (LOG 2026-11-14.23):
+
+| Cores | `n_envs` × `n_steps` | Environment steps/s | 2M steps of training | Core-minutes for 2M steps |
+|---|---|---|---|---|
+| 9 | 8 × 256 | 1,287 | about 26 min | about 234 |
+| 17 | 16 × 128 | 1,606 | about 21 min | about 357 |
+| 33 | 32 × 64 | 1,911 | about 17.5 min | about 577 |
+
+The Stage 4 runs used `--cpus-per-task=17`: 25% faster than 9 cores for about 1.5 times the credits. 33 cores costs 2.5 times the credits for 1.5 times the speed, and its 64-step rollout segments are untested. The script default stays at 9.
+
 Each job writes its console output to `slurm-<jobid>.out` in the project folder and its results to `runs/<timestamp>_<name>/`. The run folder is printed as `/vsc-hard-mounts/leuven-data/...`: that is the real path behind `/data/leuven/...`, which is a symbolic link to it. It is the same folder.
 
 ### 10.4 Tracking progress
@@ -374,7 +389,8 @@ As a batch job on a wICE A100 instead: `sbatch cluster/train_gpu.slurm --stage 3
 - Stage 3 results rest on three seeds at 2M steps and five at 1M; other stages on one to three. Use several seeds before drawing conclusions.
 - Stage 2 does not reproduce its earlier 100% on the current code: two of three seeds end with the swarm hovering just outside the success radius (LOG 2026-11-14.15).
 - About 5% of Stage 3 episodes end in a drone collision, most of them during the final approach to the target.
-- Stages 4 and 5 have not been run with the search frame and the linear learning-rate schedule. The search waypoint ignores obstacles.
+- Stage 4 rests on two seeds. Stage 5 has not been run with the current settings.
+- The search frame points straight at the waypoint, also through obstacles. The remaining Stage 4 failures (about 10%) are mostly obstacle crashes during search, as for the obstacle-blind Greedy (LOG 2026-11-14.22).
 - Models trained before 2026-11-14 keep the same observation size (126) but were trained with a different frame and map, so they cannot be evaluated in the current environment.
 - No periodic checkpoints or resume after interruption.
 - The policy has no memory beyond the searched map.

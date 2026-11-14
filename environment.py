@@ -146,7 +146,8 @@ class DroneSwarm2D(gym.Env):
         if len(self.obstacles):
             obs = self.obstacles.astype(np.float64)
             min_t = np.minimum(min_t, circle_hits(obs[:, :2], obs[None, :, 2] + c.drone_radius))
-        min_t = np.minimum(min_t, circle_hits(pos, 2.0 * c.drone_radius, exclude_self=True))
+        if c.rays_see_drones:
+            min_t = np.minimum(min_t, circle_hits(pos, 2.0 * c.drone_radius, exclude_self=True))
 
         return (min_t / c.vision_range).astype(np.float32)
 
@@ -171,6 +172,32 @@ class DroneSwarm2D(gym.Env):
         error = np.abs(current - desired)
         np.fill_diagonal(error, 0.0)
         return error.sum(axis=1) / (n - 1)
+
+    def _obstacle_cells(self):
+        """Cells that cannot contain the target because of the random obstacles.
+
+        _generate_obstacles keeps the target at least radius + success_radius + obstacle_safe_margin from each obstacle
+        centre. A cell is excluded when its part inside the target sampling square lies entirely within that distance of
+        one obstacle: the region is a rectangle and the exclusion zone a disk, so all four corners inside the disk is exact.
+        A cell covered only jointly by two disks stays searchable; that errs on the safe side, so a fully searched map
+        still implies the target was found.
+        """
+        c = self.cfg
+        cells = np.zeros(len(self.cell_centers), dtype=bool)
+        if not (c.skip_obstacle_cells and c.random_obstacles and len(self.obstacles)):
+            return cells
+        lo, hi = (c.edge_margin, c.world_size - c.edge_margin) if c.random_target else (0.0, c.world_size)
+        half = c.explore_cell / 2
+        rect_lo = np.maximum(self.cell_centers - half, lo)
+        rect_hi = np.minimum(self.cell_centers + half, hi)
+        valid = np.all(rect_lo < rect_hi, axis=1)
+        corners = np.stack(
+            [rect_lo, np.stack([rect_lo[:, 0], rect_hi[:, 1]], 1), np.stack([rect_hi[:, 0], rect_lo[:, 1]], 1), rect_hi],
+            axis=1,
+        )  # (cells, 4, 2)
+        keep_out = self.obstacles[:, 2] + c.success_radius + c.obstacle_safe_margin  # (M,)
+        d = np.linalg.norm(corners[:, :, None, :] - self.obstacles[None, None, :, :2], axis=3)  # (cells, 4, M)
+        return valid & np.any(np.all(d < keep_out[None, None, :], axis=1), axis=1)
 
     def _update_search(self):
         # Returns per drone the number of cells it searched for the first time (shared if several drones are first); may flip target_found.
@@ -358,7 +385,9 @@ class DroneSwarm2D(gym.Env):
         self.headings = np.full(self.n, self.np_random.uniform(-np.pi, np.pi), dtype=np.float32)
         self.obstacles = self._generate_obstacles()
         self.steps = 0
-        self.searched = ~self.searchable  # cells that cannot contain the target need no search
+        # Cells that cannot contain the target need no search: those along the walls, and those around the obstacles.
+        self.searchable_now = self.searchable & ~self._obstacle_cells()
+        self.searched = ~self.searchable_now
         self.target_found = False
         self.frame_angle = np.zeros(self.n, dtype=np.float32)
 
@@ -528,7 +557,7 @@ class DroneSwarm2D(gym.Env):
             "collision_pos": None if collision_pos is None else [float(collision_pos[0]), float(collision_pos[1])],
             "cohesion_error": cohesion_error,
             "target_found": self.target_found,
-            "searched_fraction": float(self.searched[self.searchable].mean()),  # of the cells that can hold the target
+            "searched_fraction": float(self.searched[self.searchable_now].mean()) if self.searchable_now.any() else 1.0,  # of the cells that can hold the target
             "mean_target_distance": float(np.mean(target_dist)),
             "max_target_distance": float(np.max(target_dist)),
             "min_obstacle_clearance": float(obs_clear.min()),
