@@ -36,11 +36,14 @@ class EnvConfig:
     start_spread: float = 0.5          # drones start evenly spaced on a circle of this radius around the start centre
     success_radius: float = 0.8        # success = every drone within this distance of the target
     cohesion_radius: float = 1.0       # max distance from the swarm centroid before the cohesion penalty applies
-    search_cohesion_radius: float = 2.0  # same limit while the target is still hidden, so drones can spread out
+    search_cohesion_radius: float = 1.0  # same limit while the target is still hidden; above cohesion_radius lets the swarm spread out to search
 
     # --- target search (the target is hidden from the policy until found) ---
     target_sense_range: float = 1.5    # a drone detects the target, and marks map cells searched, within this distance
     explore_cell: float = 1.0          # cell size of the searched map: (world_size / cell)^2 values in the observation
+    skip_targetless_cells: bool = True  # cells that cannot contain a random target (outside edge_margin) start as searched: no reward, never a waypoint
+    waypoint_frame: bool = True        # while searching, the drones share a frame whose +x always points from the swarm centroid to the search waypoint; false = world axes
+    observe_search_map: bool = True    # false hides the searched map and own position from the policy (zeros), leaving the waypoint as the only search guidance
 
     # --- obstacle vision (rays point along each drone's velocity) ---
     num_rays: int = 7
@@ -61,7 +64,8 @@ class EnvConfig:
 class RewardConfig:
     # Per-step terms; the success/collision terms are paid once because the episode ends.
     target_found_bonus: float = 70.0   # + once, on first detection; above the exploration a full map can yield (about 67)
-    search_waypoint_weight: float = 1.0
+    search_waypoint_weight: float = 2.0   # + weight * decrease in the drone's own distance to the search waypoint (only until found); same scale as progress_weight
+    search_formation_weight: float = 0.75  # - weight * formation error per step while searching; 0 lets the swarm break formation before detection
 
     wall_weight: float = 3.0
     wall_margin: float = 1.0
@@ -81,9 +85,10 @@ class RewardConfig:
 @dataclass
 class PPOConfig:
     learning_rate: float = 3e-4
+    lr_schedule: str = "constant"      # "constant", or "linear": learning_rate falls linearly to 0 over the run, which settles the policy late in training
     n_envs: int = 4                    # parallel environments (separate processes if > 1); n_steps below is per environment
-    n_steps: int = 256                 # rollout length per environment per update; n_envs * n_steps = environment steps per update (keep 1024)
-    batch_size: int = 192              # minibatch of drone samples; one update holds n_steps * n_envs * num_drones samples (3072 by default)
+    n_steps: int = 512                 # rollout length per environment per update; n_envs * n_steps = environment steps per update (keep 2048: 1024 holds too few episodes per update and made Stage 3 seed-dependent)
+    batch_size: int = 192              # minibatch of drone samples; one update holds n_steps * n_envs * num_drones samples (6144 by default)
     n_epochs: int = 10
     gamma: float = 0.99                # discount; 0.99 looks ~100 steps (10 s) ahead
     gae_lambda: float = 0.95
@@ -123,6 +128,7 @@ class Config:
 # run.timesteps are rough starting budgets: adjust them from eval_curve.csv / training_curves.png.
 _NO_OBSTACLES = {"env.min_obstacles": 0, "env.max_obstacles": 0}
 _KNOWN_TARGET = {"env.target_sense_range": 20.0}  # larger than the world: the target is found at step 0
+_SEARCH_TRAINING = {"ppo.lr_schedule": "linear"}  # search stages: a constant learning rate left the outcome to the seed (33% to 88%)
 STAGES: dict[str, dict] = {
     "1_known_fixed": {  # one fixed layout, target known, no obstacles: proves the setup works at all
         **_NO_OBSTACLES, **_KNOWN_TARGET,
@@ -132,12 +138,12 @@ STAGES: dict[str, dict] = {
         **_NO_OBSTACLES, **_KNOWN_TARGET, "run.timesteps": 500_000,
     },
     "3_search": {  # target hidden: the swarm must explore
-        **_NO_OBSTACLES, "run.timesteps": 1_000_000,
+        **_NO_OBSTACLES, **_SEARCH_TRAINING, "run.timesteps": 2_000_000,  # 1M left one seed in five at 62%; 2M gave 93-95% on three
     },
     "4_search_few_obstacles": {  # search plus 1-2 random obstacles
-        "env.min_obstacles": 1, "env.max_obstacles": 2, "run.timesteps": 1_000_000,
+        **_SEARCH_TRAINING, "env.min_obstacles": 1, "env.max_obstacles": 2, "run.timesteps": 1_000_000,
     },
-    "5_full": {"run.timesteps": 3_000_000},  # defaults: hidden target, 3-5 random obstacles, everything random
+    "5_full": {**_SEARCH_TRAINING, "run.timesteps": 3_000_000},  # defaults: hidden target, 3-5 random obstacles, everything random
 }
 
 
@@ -224,6 +230,8 @@ def validate(cfg: Config) -> None:
         raise ValueError("ppo.n_envs must be at least 1")
     if p.device != "auto" and p.device != "cpu" and not p.device.startswith("cuda"):
         raise ValueError('ppo.device must be "auto", "cpu", "cuda" or "cuda:<index>"')
+    if p.lr_schedule not in ("constant", "linear"):
+        raise ValueError('ppo.lr_schedule must be "constant" or "linear"')
     if p.batch_size > p.n_steps * p.n_envs * e.num_drones:
         raise ValueError("ppo.batch_size must not exceed ppo.n_steps * ppo.n_envs * env.num_drones")
     if r.obstacle_weight > 0 and r.obstacle_margin <= 0:
@@ -268,8 +276,8 @@ def validate(cfg: Config) -> None:
         raise ValueError(
             "reward.wall_weight needs reward.wall_margin > 0"
         )
-    if r.formation_weight < 0:
-        raise ValueError("reward.formation_weight must be non-negative")
+    if r.formation_weight < 0 or r.search_formation_weight < 0:
+        raise ValueError("reward.formation_weight and reward.search_formation_weight must be non-negative")
     if not 0.0 <= e.action_residual_scale <= 1.0:
         raise ValueError(
             "env.action_residual_scale must be between 0 and 1"

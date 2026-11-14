@@ -9,6 +9,7 @@ Commit history: this workspace has no `.git` folder, so per-commit hashes are no
 - [2026-10-31: Handoff and Stage 1 experiments](#2026-10-31-handoff-and-stage-1-experiments)
 - [2026-11-05: Stage 3 review, fixes, and documentation restructure](#2026-11-05-stage-3-review-fixes-and-documentation-restructure)
 - [2026-11-14: GPU environment](#2026-11-14-gpu-environment)
+- [2026-11-14 (evening): Stage 3 diagnosis and fix](#2026-11-14-evening-stage-3-diagnosis-and-fix)
 
 ---
 
@@ -329,3 +330,350 @@ Training throughput, from the last row of each run's `sb3_log/progress.csv` (`ti
 - Added `cluster/progress.py`, which reads `sb3_log/progress.csv` (written by SB3 after every update) and `config.json`, and reports environment steps (SB3 timesteps divided by `num_drones`), elapsed time, a linear estimate of the remaining time, last-rollout success and the latest periodic evaluation. Standard library only.
 - `run_experiment.py` prints run folders via `Path.resolve()`, which shows `/vsc-hard-mounts/leuven-data/...`. `/data/leuven` is a symbolic link to `/vsc-hard-mounts/leuven-data` (the same inode was confirmed), so there is one folder. Not changed.
 - README section 10 was restructured into 10.1 (venvs), 10.2 (interactive versus batch), 10.3 (batch jobs), 10.4 (progress tracking) and 10.5 (GPU).
+
+---
+
+## 2026-11-14 (evening): Stage 3 diagnosis and fix
+
+Working branch: `martin-branch`. Code state before this entry: commit 306ce9a.
+
+Conventions used in this entry:
+
+- All training ran as CPU batch jobs with `cluster/train_cpu.slurm`: 9 cores, `ppo.n_envs=8`, `--no-gif`.
+- Final evaluation: 100 episodes with the deterministic policy, 95% Wilson intervals. Evaluation seeds start at `seed + 1000`.
+- **Found:** share of episodes in which the target is detected. **Conversion:** share of those episodes that end in success.
+- Outcome counts are given as boundary / drone collision / timeout out of 100 episodes.
+- "Before" is run `20261114_190757_search` (seed 42, 1M steps).
+
+### 2026-11-14.8 Summary
+
+- Stage 3 went from 36% to 43% success to 94%, 93% and 95% on three training seeds at 2M steps. It passes the 80% gate.
+- Four causes were found. The evidence for each is in 2026-11-14.9 to 2026-11-14.13.
+
+| # | Cause | Fix |
+|---|---|---|
+| 1 | The 36 border cells of the searched map could only be searched from inside the wall zone, and can never contain the target | Cells that cannot contain the target start as searched |
+| 2 | Search let the swarm spread out; at detection a formation penalty about five times the progress reward switched on | Formation and cohesion are shaped the same way in both phases |
+| 3 | In the world frame the policy ignored the waypoint and flew an open-loop sweep indexed by the map | During search, one shared frame whose +x points from the swarm centroid to the waypoint, updated every step; waypoint reward per drone |
+| 4 | 1,024 environment steps per PPO update and a constant learning rate left the outcome to the training seed | 2,048 steps per update; linear learning-rate decay for stages 3 to 5; Stage 3 budget 2M steps |
+
+- Side finding: Stage 2 does not reproduce its 100% of 2026-11-05 on the current code (2026-11-14.15). Open.
+- Cost: 35 batch jobs, 9,858 credits, 67.3 core-hours (2026-11-14.17).
+
+### 2026-11-14.9 Round 0: diagnosis before any change
+
+No training. The saved model of the "before" run and the Greedy baseline were rolled out on the same 300 episodes (seeds 1042 to 1341), and every failure was classified by phase.
+
+| Policy | Success | Found | Conversion | Failures |
+|---|---|---|---|---|
+| Greedy | 63.0% (189/300) | 63.0% | 100% | 111 boundary, all during search |
+| PPO | 36.3% (109/300) | 65.0% | 55.9% | Search: 64 boundary, 40 drone collision, 1 timeout. Approach: 40 boundary, 35 drone collision, 11 timeout |
+
+Findings:
+
+1. **Border cells (cause 1).** Greedy is scripted and scored 99% in the runs of 2026-11-05. It scored 73% (22/30) in the "before" run. The only environment changes in between were those of 2026-11-05.2.
+   - With `cell_reach = 1.5 - 0.71 = 0.79 m`, a border cell (centre 0.5 m from a wall) can only be searched from inside the wall-penalty zone. For a corner cell the best position has 0.91 m clearance, against `wall_margin = 1.0`.
+   - In 108 of Greedy's 111 crashes its goal was a border cell.
+   - The target is sampled in [1, 9]², so the 36 border cells cannot contain it.
+2. **Hand-over at detection (cause 2).** PPO conversion against the swarm's largest pairwise distance at the moment of detection:
+
+   | Spread at detection | Episodes | Conversion | Main failure |
+   |---|---|---|---|
+   | below 1.5 m | 57 | 74% | drone collision |
+   | 1.5 to 2.5 m | 55 | 71% | drone collision |
+   | 2.5 to 3.5 m | 36 | 53% | mixed |
+   | above 3.5 m | 47 | 19% | boundary (29 of 47) |
+
+   - Mean formation error at detection was 1.29 m: a formation penalty of 0.97 per step against a maximum progress reward of 0.20 per step.
+   - Failed approaches accumulated -102.4 in formation and cohesion penalties, successful ones -16.7. A collision costs -10, so ending the episode was cheaper than regrouping.
+3. **Waypoint not followed.** The `search_waypoint` reward was negative in 90% of episodes (mean -3.27): the centroid ended farther from its waypoints.
+4. **Late degradation (cause 4).** Training success per 100k steps peaked at 48% (600k to 700k) and ended at 36%. The found rate fell from 73% to 59%. Each PPO update held about 3 to 9 finished episodes.
+5. Stage 2 (known target) had scored 100% on two seeds on 2026-11-05, so the approach itself was learnable.
+
+### 2026-11-14.10 Round 1: map and reward fixes
+
+Hypothesis: removing causes 1 and 2, with a stronger waypoint reward, turns search into a formation flight to the waypoint.
+
+Changes:
+
+| File | Change |
+|---|---|
+| `config.py`, `environment.py` | New `env.skip_targetless_cells = True`: cells outside the target sampling square start as searched (64 of 100 remain) |
+| `config.py`, `environment.py` | New `reward.search_formation_weight = 0.75`: formation is shaped before detection too. `env.search_cohesion_radius` 2.0 to 1.0 |
+| `config.py`, `environment.py` | `search_waypoint` reward: each drone's own distance to the waypoint instead of the centroid's. `reward.search_waypoint_weight` 1.0 to 2.0 |
+| `config.py`, `training.py` | New `ppo.lr_schedule` (`constant` by default, or `linear`) |
+| `environment.py` | `info["searched_fraction"]` counts only the cells that can contain the target |
+
+Scripted checks before training (300 episodes): Greedy 63% to 100%; a scripted policy that flies in formation to the waypoint the network observes, 100%.
+
+Results (jobs 62694480 to 62694486, 1M steps):
+
+| Run folder | Seed | Change against this round's defaults | Success [95% CI] | Found | Conversion | Outcomes |
+|---|---|---|---|---|---|---|
+| `20261114_195052_s3fix` | 42 | none | 50% [40–60] | 69% | 72% | 34 / 16 / 0 |
+| `20261114_195155_s3fix` | 43 | none | 50% [40–60] | 55% | 91% | 39 / 11 / 0 |
+| `20261114_195254_s3fix` | 44 | none | 32% [24–42] | 55% | 58% | 44 / 23 / 1 |
+| `20261114_195055_s3fix_lr_linear` | 42 | `ppo.lr_schedule=linear` | 35% [26–45] | 41% | 85% | 7 / 50 / 8 |
+| `20261114_195101_s3fix_abl_border_cells` | 42 | `env.skip_targetless_cells=false` | 28% [20–37] | 38% | 74% | 20 / 50 / 2 |
+| `20261114_195055_s3fix_abl_free_search` | 42 | `reward.search_formation_weight=0`, `env.search_cohesion_radius=2.0` | 48% [38–58] | 68% | 71% | 13 / 39 / 0 |
+| `20261114_195055_s3fix_abl_no_waypoint_reward` | 42 | `reward.search_waypoint_weight=0` | 38% [29–48] | 60% | 63% | 45 / 17 / 0 |
+
+Findings:
+
+- Not solved. Conversion rose from 56% to between 58% and 91%. The found rate stayed between 55% and 69%.
+- The waypoint reward was still negative (-5 to -6 per episode), although it was now per drone and twice as strong.
+- Input sensitivity of the trained policies during search (mean action magnitude about 0.6), for the "before" model and two `s3fix` models:
+
+  | Input changed | Mean change in action |
+  |---|---|
+  | Waypoint vector reversed | 0.07 to 0.09 |
+  | Own position shuffled between states | 0.21 to 0.23 |
+  | Searched map shuffled between states | 0.80 to 0.88 |
+
+- The mean cosine between a drone's velocity and the direction to its waypoint was -0.35 to -0.55. `trajectories.png` of `20261114_195155_s3fix` shows the same arc in every episode.
+- Inside the last 0.6 m before a wall the policy's mean acceleration relative to the wall was about zero (+0.04 at 0 to 0.3 m, -0.02 at 0.3 to 0.6 m).
+- Interpretation: about 50 active map bits and the absolute position dominate a two-number waypoint vector of magnitude about 0.2. The policy learns a sweep indexed by map and position. Stage 2 never has to read a direction, because its frame puts the target on +x.
+- The ablations of this round ran while the policy ignored the waypoint. They do not show what the formation and waypoint-weight changes contribute. The border-cell fix is supported independently by the Greedy result.
+
+### 2026-11-14.11 Round 2: search frame pointing at the waypoint
+
+Hypothesis: with +x pointing at the waypoint, as it points at the target in Stage 2, the policy follows the waypoint.
+
+Changes:
+
+| File | Change |
+|---|---|
+| `config.py`, `environment.py` | New `env.waypoint_frame = True`: during search all drones share one frame whose +x points from the swarm centroid to the waypoint. In this round it was fixed when the waypoint was chosen |
+| `config.py`, `environment.py` | New `env.observe_search_map = True`: `false` replaces own position and the searched map with zeros |
+
+- A first version with one frame per drone was rejected by the scripted checks before any job ran: Greedy 49%, waypoint follower 19%, and a constant "+x" action collided in 150 of 150 episodes. Drones 0.87 m apart that look at a waypoint 1 to 1.5 m away have frames 40° to 60° apart, so "+x" makes them converge on every waypoint.
+- Scripted checks with the shared frame: Greedy 100%, waypoint follower 100%. A constant action (+1, 0) found the target in 39% of episodes, against 7% in the world frame.
+
+Results (jobs 62694613 to 62694617, 1M steps):
+
+| Run folder | Seed | Change against this round's defaults | Success [95% CI] | Found | Conversion | Outcomes |
+|---|---|---|---|---|---|---|
+| `20261114_202052_s3frame` | 42 | none | 65% [55–74] | 66% | 98% | 30 / 5 / 0 |
+| `20261114_202153_s3frame` | 43 | none | 65% [55–74] | 68% | 96% | 31 / 3 / 1 |
+| `20261114_202055_s3frame_nomap` | 42 | `env.observe_search_map=false` | 44% [35–54] | 88% | 50% | 7 / 49 / 0 |
+| `20261114_202153_s3frame_nomap` | 43 | `env.observe_search_map=false` | 57% [47–66] | 98% | 58% | 27 / 16 / 0 |
+| `20261114_202053_s3_worldframe_nomap` | 42 | `env.waypoint_frame=false`, `env.observe_search_map=false` | 0% [0–4] | 19% | 0% | 0 / 100 / 0 |
+
+Findings:
+
+- The policy now follows the waypoint: the waypoint reward rose to +12.3 and +12.7 per episode, conversion to 96% and 98%, and drone collisions fell to 3% and 5%.
+- Hiding the map without the frame does nothing (0%). The frame is what matters.
+- Hiding the map with the frame raised the found rate (88% and 98%) and lowered conversion (50% and 58%). The default stays `true`. Not explained; one reading is that the map bits tell the network which phase it is in.
+- Remaining failure: about 30% boundary crashes during search. On 200 episodes of `20261114_202153_s3frame` there were 52 of them.
+  - In 96% the crashing drone was flying away from its waypoint, at +0.92 m/s along the frame's +x.
+  - The median time since the waypoint last changed was 42 steps.
+  - The swarm had passed the waypoint without any drone coming within 0.79 m of it. The fixed frame kept pointing along the old line, into the wall.
+
+### 2026-11-14.12 Round 3: frame tracks the waypoint
+
+Change: `environment.py`, `_refresh_search_goal`: the search frame is recomputed every step, so +x always points from the centroid to the waypoint.
+
+Scripted checks (300 episodes):
+
+- Greedy 100% (mean 164 steps, maximum 406). Waypoint follower 100% (mean 179 steps, maximum 444; the limit is 800).
+- A constant action (+1, 0) found the target in 79% of episodes.
+- Stages 1 and 2: observations and rewards identical step for step to the code before this entry (1,530 and 1,362 steps compared).
+
+Results (jobs 62694807 to 62694810, 1M steps):
+
+| Run folder | Seed | Change against this round's defaults | Success [95% CI] | Found | Conversion | Outcomes |
+|---|---|---|---|---|---|---|
+| `20261114_204344_s3track` | 42 | none | 88% [80–93] | 96% | 92% | 0 / 11 / 1 |
+| `20261114_204441_s3track` | 43 | none | 70% [60–78] | 73% | 96% | 13 / 16 / 1 |
+| `20261114_204542_s3track` | 44 | none | 33% [25–43] | 62% | 53% | 44 / 21 / 2 |
+| `20261114_204344_s3track_nomap` | 42 | `env.observe_search_map=false` | 65% [55–74] | 97% | 67% | 21 / 14 / 0 |
+
+Findings:
+
+- Seed 42 reached 95% training success in the last 20% of the run with no boundary crashes. The environment is learnable.
+- Seed 43 reached 75% (500k to 600k) and fell back to between 53% and 61%. Its wall penalty per episode rose from -11 to -39.
+- Seed 44 stayed near 30% from 400k onwards. At its boundary crashes the swarm was 2.39 m wide on average (the formation is 0.87 m).
+- In all seeds `approx_kl` rose from 0.010 to 0.021 and the clip fraction from 0.10 to 0.21, while the action standard deviation fell from about 0.35 to between 0.12 and 0.15.
+- Flight quality against Stage 2, final evaluation:
+
+  | | Formation error | Separation penalty | Wall penalty | Rollout |
+  |---|---|---|---|---|
+  | Stage 2 PPO, 2026-11-05 (100%) | 0.015 and 0.055 m | -0.1 and -0.2 | -0.9 and -0.8 | 4 × 512 = 2,048 steps per update |
+  | Stage 3 `s3track` | 0.15 to 0.24 m | -5.1 to -7.0 | -11.2 to -14.8 | 8 × 128 = 1,024 steps per update |
+
+- The Stage 1 and Stage 2 runs that scored 100% on 2026-11-05 all used 2,048 steps per update. The batch script used 1,024, which is the open item of 2026-11-14.6. With episodes of about 200 steps, an 8 × 128 rollout holds about five episodes.
+
+### 2026-11-14.13 Round 4: PPO update size and learning-rate schedule
+
+No code change. Settings were passed with `--set`.
+
+Results (jobs 62695036 to 62695041, 1M steps):
+
+| Run folder | Seed | Setting | Success [95% CI] | Found | Conversion | Outcomes |
+|---|---|---|---|---|---|---|
+| `20261114_210448_s3track_n256` | 43 | `ppo.n_steps=256` | 43% [34–53] | 48% | 90% | 34 / 23 / 0 |
+| `20261114_210551_s3track_n256` | 44 | `ppo.n_steps=256` | 95% [89–98] | 95% | 100% | 1 / 4 / 0 |
+| `20261114_210451_s3track_lin` | 43 | `ppo.lr_schedule=linear` | 77% [68–84] | 93% | 83% | 1 / 20 / 2 |
+| `20261114_210553_s3track_lin` | 44 | `ppo.lr_schedule=linear` | 75% [66–82] | 92% | 82% | 16 / 8 / 1 |
+| `20261114_210451_s3track_n256_lin` | 43 | both | 83% [74–89] | 93% | 89% | 0 / 13 / 4 |
+| `20261114_210553_s3track_n256_lin` | 44 | both | 97% [92–99] | 98% | 99% | 0 / 3 / 0 |
+
+Findings:
+
+- 2,048 steps per update alone: 43% and 95%. Still a lottery.
+- Linear decay alone: 77% and 75%. No collapse and no stuck run, but a lower ceiling.
+- Both: 83% and 97%, with training success rising through the whole run (88% and 94% in the last tenth).
+- Two seeds per setting is thin. The combination was confirmed on more seeds in the next round.
+
+### 2026-11-14.14 Rounds 5 and 6: shipped configuration and budget
+
+Changes:
+
+| File | Change |
+|---|---|
+| `config.py` | `ppo.n_steps` default 256 to 512, so the defaults give 4 × 512 = 2,048 steps per update |
+| `cluster/train_cpu.slurm` | `N_STEPS = 2048 / N_ENVS` instead of `1024 / N_ENVS` (256 with 9 cores) |
+| `config.py` | Stage presets 3, 4 and 5 set `ppo.lr_schedule=linear` |
+| `config.py` | After round 6: `3_search` budget 1M to 2M steps |
+
+- The configuration that the batch script builds for `--stage 3_search` was compared field by field with `20261114_210553_s3track_n256_lin`: no difference outside the `run` section. The two `s3track_n256_lin` runs therefore count as seeds 43 and 44 of the shipped configuration at 1M steps.
+- The `s3_final` runs used the plain command, with no `--set`.
+
+Stage 3 at 1M steps (jobs 62695145 to 62695147, and round 4 for seeds 43 and 44):
+
+| Run folder | Seed | Success [95% CI] | Found | Conversion | Outcomes |
+|---|---|---|---|---|---|
+| `20261114_212336_s3_final` | 42 | 92% [85–96] | 97% | 95% | 1 / 7 / 0 |
+| `20261114_210451_s3track_n256_lin` | 43 | 83% [74–89] | 93% | 89% | 0 / 13 / 4 |
+| `20261114_210553_s3track_n256_lin` | 44 | 97% [92–99] | 98% | 99% | 0 / 3 / 0 |
+| `20261114_212451_s3_final` | 45 | 88% [80–93] | 90% | 98% | 0 / 11 / 1 |
+| `20261114_212553_s3_final` | 46 | 62% [52–71] | 68% | 91% | 21 / 16 / 1 |
+
+Mean 84%. Seed 46 was still improving when the learning rate reached zero (training success 51%, 54%, 56% in the last three tenths).
+
+Stage 3 at 2M steps (`--timesteps 2000000`; jobs 62695148, 62695484, 62695485):
+
+| Run folder | Seed | Success [95% CI] | Found | Conversion | Outcomes |
+|---|---|---|---|---|---|
+| `20261114_212339_s3_final_2M` | 43 | 94% [88–97] | 98% | 96% | 1 / 5 / 0 |
+| `20261114_215003_s3_final_2M` | 45 | 95% [89–98] | 99% | 96% | 0 / 5 / 0 |
+| `20261114_214903_s3_final_2M` | 46 | 93% [86–97] | 96% | 97% | 0 / 6 / 1 |
+
+- Pooled: 282 of 300 episodes, 94%. Seed 46 went from 62% to 93%.
+- Independent check of the weakest seed (`20261114_214903_s3_final_2M`) on 300 other episodes (seeds 1042 to 1341): 89.7% (269/300), 95% CI [85.7–92.6]; found 95.3%; conversion 94.1%.
+  - No boundary crash. Failures: 24 drone collisions (14 in the approach, 10 during search) and 7 timeouts.
+  - Success by distance of the target from the nearest wall: 87% (1.0 to 1.5 m), 88% (1.5 to 2.5 m), 97% (above 2.5 m).
+  - Mean cosine between velocity and waypoint direction during search: +0.64 (before: -0.55).
+- The preset was changed to 2M after these runs. `--timesteps 2000000` and the preset give the same configuration; it was not run again.
+
+To reproduce:
+
+```bash
+sbatch cluster/train_cpu.slurm --stage 3_search --name search --seed 43 --episodes 100 --no-gif
+```
+
+### 2026-11-14.15 Stage 2 regression (rounds 5 to 7)
+
+One Stage 2 run was added to round 5 to check that the changed PPO defaults did not break a stage that worked. It scored 50%. Rounds 6 and 7 looked for the reason.
+
+Results (jobs 62695149, 62695486, 62695487, 62696072, 62696074, 62696076, 62696078; 500k steps):
+
+| Run folder | Seed | Setting | Success [95% CI] | Outcomes |
+|---|---|---|---|---|
+| `20261114_212344_s2_check` | 42 | current batch setting, 8 × 256 | 50% [40–60] | 0 / 0 / 50 |
+| `20261114_221852_s2_check` | 43 | 8 × 256 | 37% [28–47] | 0 / 0 / 63 |
+| `20261114_221941_s2_check` | 44 | 8 × 256 | 95% [89–98] | 2 / 2 / 1 |
+| `20261114_214904_s2_check_n128` | 42 | batch setting before this entry, 8 × 128 | 73% [64–81] | 0 / 0 / 27 |
+| `20261114_221847_s2_check_n128` | 43 | 8 × 128 | 47% [38–57] | 0 / 4 / 49 |
+| `20261114_221941_s2_check_n128` | 44 | 8 × 128 | 98% [93–99] | 0 / 2 / 0 |
+| `20261114_214904_s2_check_nov5_settings` | 42 | settings of the 2026-11-05 run: 4 × 512, `ppo.ent_coef=0.0`, `reward.formation_weight=0.5` | 84% [76–90] | 0 / 1 / 15 |
+
+Findings:
+
+- Stage 2 fails on two of three seeds under both batch settings. The regression is not caused by the changes of this entry: the Stage 2 environment is identical step for step, and the setting used before this entry fails the same seeds.
+- Failure mode, the same in every failing run: the swarm arrives and hovers just outside the success radius. In `20261114_212344_s2_check` the timeouts ended with the swarm centre 0.75 m from the target, the worst drone at 1.06 m (success needs below 0.8 m), and a formation error of 0.08 m.
+- Learning starts late. The runs above have 0% training success for the first 150k to 400k steps. In `20261114_212344_s2_check`, 93% to 99% of the episodes in the first 150k steps ended in a drone collision. The 2026-11-05 run had 25% success in its first 100k steps and 95% in the second.
+- Changes between the 2026-11-05 run (code snapshot in `runs/20261105_110151_stage2_random_seed42`) and the code before this entry that affect Stage 2:
+  - The collision penalty changed from the drones that caused the crash to every drone.
+  - `reward.formation_weight` 0.5 to 0.75, `ppo.ent_coef` 0.0 to 0.005, default `ppo.n_steps` 512 to 256.
+  - The observation gained two entries for the waypoint, which are zero in Stage 2.
+- Restoring the formation weight, the entropy coefficient and the rollout gave 84%, not 100%. That leaves the collision-penalty scope as the main untested suspect.
+- 8 × 256 scored lower than 8 × 128 on each of the three seeds (mean 61% against 73%). Three seeds with swings this large do not establish the difference. A possible reason: the failing runs are slow starters, and 2,048 steps per update gives half as many updates in 500k steps.
+
+### 2026-11-14.16 Code changes (final state)
+
+| File | Location | Change | Reason |
+|---|---|---|---|
+| `config.py` | `EnvConfig` | New `skip_targetless_cells: bool = True` | Cause 1 |
+| `config.py` | `EnvConfig` | New `waypoint_frame: bool = True` | Cause 3 |
+| `config.py` | `EnvConfig` | New `observe_search_map: bool = True` | Ablation switch (2026-11-14.11) |
+| `config.py` | `EnvConfig` | `search_cohesion_radius` 2.0 to 1.0 | Cause 2 |
+| `config.py` | `RewardConfig` | New `search_formation_weight: float = 0.75` | Cause 2 |
+| `config.py` | `RewardConfig` | `search_waypoint_weight` 1.0 to 2.0 | Same form and scale as `progress_weight` |
+| `config.py` | `PPOConfig` | New `lr_schedule: str = "constant"`; `n_steps` 256 to 512 | Cause 4 |
+| `config.py` | `STAGES` | Stages 3 to 5 set `ppo.lr_schedule=linear`; `3_search` budget 1M to 2M | Cause 4 |
+| `config.py` | `validate` | Rejects unknown `lr_schedule` values and a negative `search_formation_weight` | Input checking |
+| `environment.py` | `__init__` | `self.searchable`: cells that intersect the target sampling square | Cause 1 |
+| `environment.py` | `reset` | `self.searched` starts as `~self.searchable` | Cause 1 |
+| `environment.py` | `_refresh_search_goal` | Restructured. Sets the shared search frame every step when `waypoint_frame` is on | Cause 3 |
+| `environment.py` | `_observation` | Own position and map are zeros when `observe_search_map` is off | Ablation switch |
+| `environment.py` | `step` | Waypoint progress per drone, measured against the waypoint held before the move | Cause 3 |
+| `environment.py` | `step` | Formation term in both phases, with `search_formation_weight` before detection | Cause 2 |
+| `environment.py` | `step` | `info["searched_fraction"]` over searchable cells only | Follows from cause 1 |
+| `environment.py` | class docstring, comments | Describe the two frames and the cohesion limit | Documentation |
+| `training.py` | `train` | Passes a `LinearSchedule` to PPO when `lr_schedule` is `linear` | Cause 4 |
+| `cluster/train_cpu.slurm` | body | `N_STEPS = 2048 / N_ENVS` | Cause 4 |
+| `cluster/train_cpu.slurm` | header | Note on same-name jobs that start in the same second | See 2026-11-14.17 |
+| `README.md` | 4.2, 4.3, 4.6, 5, 6, 7, 10.2, 10.3, 11, 12 | Frames, searchable cells, reward table, PPO settings, budgets and status, chained seed loop, limitations, glossary | Documentation |
+
+Behaviour impact:
+
+- **Stages 1 and 2:** the environment is unchanged. The PPO rollout changes: 4 × 512 by default and 8 × 256 in batch jobs, instead of 4 × 256 and 8 × 128.
+- **Stages 3 to 5:** the map, the frame, the search rewards, the learning-rate schedule and the Stage 3 budget all change.
+- **Saved models:** the observation size is still 126, but its meaning changed. Models trained before this entry cannot be evaluated in the current environment.
+
+### 2026-11-14.17 Verification, cost and housekeeping
+
+- Passed: `py_compile` of the changed modules; `run_experiment.py --list-params`; rejection of `ppo.lr_schedule=cosine`; two 2,000-step smoke runs (`20261114_194843_smoke_s3fix_constant`, `20261114_194854_smoke_s3fix_linear`).
+- Passed: reward bookkeeping on Stage 3. The reward terms sum to the reward, and the per-drone waypoint reward matches an independent calculation.
+- Passed: in 300 scripted episodes there was no step with the map fully searched and the target not found.
+- No automated test suite was added. The analysis scripts for this entry were run from a temporary folder and are not in the repository.
+- Cost, from `sam-list-usagerecords`: 35 batch jobs, 9,858 credits, 67.3 core-hours.
+
+  | Job | Duration | Credits |
+  |---|---|---|
+  | Stage 3, 1M steps (25 jobs) | 12 to 20 min | 254 to 439 |
+  | Stage 3, 2M steps (3 jobs) | 22 to 28 min | 493 to 604 |
+  | Stage 2, 500k steps (7 jobs) | 6 to 9 min | 134 to 200 |
+
+- Balance of `lp_deeplearning_gt_2026b` on 2026-11-14 at 22:29: 602,747. This user's batch jobs that day total 10,360 credits. The rest of the drop from the 729,668 noted in 2026-11-14.7 does not come from this user's jobs.
+- All jobs that were not chained started within a minute of submission, with `--time=00:40:00`. `sbatch --test-only` had estimated a 45-minute wait.
+- Run folders are named by start time to the second. Same-name seeds were chained with `--dependency=after:<jobid>+1` so that two jobs could not create the same folder (README 10.3). `make_run_dir` is unchanged.
+- `runs/` grew from 25 MB to 128 MB. No run was deleted.
+
+### 2026-11-14.18 What the results establish and do not
+
+Supported:
+
+- Stage 3 passes the 80% gate at 2M steps: 94%, 93% and 95% on three training seeds, and 89.7% on 300 further episodes for the weakest of them.
+- The border-cell fix: a scripted policy goes from 63% to 100% with it, and PPO fell to 28% without it in round 1.
+- The search frame: the waypoint reward changed sign, and the same setup without the frame scored 0% (round 2).
+- The frame has to track the waypoint: the boundary crashes of round 2 were flights past a missed waypoint, and they disappeared in round 3.
+- The 2,048-step update with linear decay is more reliable than either alone or neither (round 4, two seeds each; then five seeds).
+
+Not established:
+
+- What the formation shaping during search and the waypoint weight of 2.0 contribute on the final configuration. Their ablations ran in round 1, before the frame existed.
+- Why hiding the map raises the found rate and lowers conversion.
+- That 1M steps is enough: four of five seeds passed, one reached 62%.
+- That the settings carry over to Stages 4 and 5.
+- The cause of the Stage 2 regression, and whether 2,048 steps per update makes it worse.
+- Stage 1 on the current code. It has not been run since 2026-11-05.
+
+### 2026-11-14.19 Next steps
+
+1. **Stage 2.** Test the collision-penalty scope. `culprits` is already computed in `step`, so the change is one line. Three seeds for each scope at 500k steps is six jobs, about 1,100 credits. Until then, `--set ppo.n_steps=128` scored higher than the default on each seed.
+2. **Stage 3 approach collisions (about 5%).** After detection each drone still has its own frame, so "+x" makes the drones converge. A shared frame from the centroid to the target is the natural test: the formation radius (0.5 m) is smaller than the success radius (0.8 m), so the swarm does not need to converge. It changes Stages 1 and 2 as well and needs their runs repeated.
+3. **Ablations on the final configuration**, if the contribution of each change is needed: `env.skip_targetless_cells=false`; `reward.search_formation_weight=0` with `env.search_cohesion_radius=2.0`; `reward.search_waypoint_weight=0`. Three 2M-step jobs.
+4. **Before Stage 4.** The waypoint ignores obstacles. A cell whose centre lies deep inside an obstacle cannot be searched, because no drone can come within 0.79 m of it, so the waypoint would stay there for the rest of the episode. Such cells cannot contain the target either (`obstacle_safe_margin`) and should start as searched.
+5. **Tooling.** Make `make_run_dir` safe for same-name jobs that start in the same second. The periodic evaluation uses 10 fixed episodes and is noisy; windows of `training_episodes.csv` are a steadier measure.

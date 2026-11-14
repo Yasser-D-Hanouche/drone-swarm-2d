@@ -60,7 +60,17 @@ Each step the acceleration updates velocity, velocity is clipped to the maximum 
 
 ### 4.2 Actions
 
-The action is a `(3, 2)` array in $[-1, 1]$: one two-component acceleration per drone, scaled by `max_accel`. Each drone's axes are rotated so that $+x$ points from that drone to the target. The frame is fixed at the moment of detection and is the world frame before then.
+The action is a `(3, 2)` array in $[-1, 1]$: one two-component acceleration per drone, scaled by `max_accel`. Actions and observed vectors use a rotated frame whose $+x$ axis points at the current goal.
+
+| Phase | Goal | Frame |
+|---|---|---|
+| Search (target hidden) | Search waypoint (section 4.3) | One frame shared by all drones. $+x$ points from the swarm centroid to the waypoint. Updated every step. |
+| Approach (target found) | Target | One frame per drone. $+x$ points from that drone to the target. Fixed at the moment of detection. |
+
+- "Accelerate along $+x$" is correct in both phases, so the policy does not have to read a direction from its observation.
+- During search the frame is shared, so the same action moves the swarm as a body and keeps its shape. One frame per drone would make the drones converge on every waypoint.
+- During search the frame follows the waypoint. A frame fixed when the waypoint is chosen keeps pointing along the old line after the swarm passes the waypoint without searching it.
+- `env.waypoint_frame=false` uses world axes during search. PPO then ignores the waypoint (LOG 2026-11-14.10 and 2026-11-14.11).
 
 An optional coupling blends each drone's action toward the swarm mean: $a_i' = \bar{a} + \alpha (a_i - \bar{a})$, where $\alpha$ is `env.action_residual_scale`. The default $\alpha = 1$ gives independent actions.
 
@@ -69,7 +79,9 @@ An optional coupling blends each drone's action toward the swarm mean: $a_i' = \
 - In the full task the target is hidden and randomised each episode.
 - A drone detects the target within `target_sense_range` (1.5 m). Once any drone detects it, the whole swarm knows its position.
 - The searched map has 10 × 10 cells of 1 m. A cell counts as searched when its centre is within about 0.79 m of a drone. That is the sensing range minus half a cell diagonal, so a fully searched map guarantees detection.
-- Before detection, the observation contains the searched map and a waypoint vector toward the unsearched cell nearest the centroid.
+- Cells that cannot contain the target start as searched (`env.skip_targetless_cells`). A random target lies at least `edge_margin` (1 m) from every wall, so the 36 border cells hold nothing to find. The 64 remaining cells have centres at least 1.5 m from a wall. Searching a border cell would mean flying inside the wall-penalty zone (LOG 2026-11-14.9).
+- The search waypoint is the unsearched cell nearest the swarm centroid. It is kept until that cell is searched.
+- Before detection, the observation contains the searched map and each drone's vector to the waypoint.
 - Stages 1 and 2 set the sensing range to 20 m, so the target is known from the start.
 
 ### 4.4 Obstacles and walls
@@ -92,7 +104,7 @@ Each drone receives one observation row. For three drones the row has 126 values
 
 | Block | Size | Content |
 |---|---|---|
-| Velocity | 2 | Normalised by maximum speed, in the drone frame |
+| Velocity | 2 | Normalised by maximum speed, in the frame of section 4.2 |
 | Target vector | 2 | Zero until found; scaled by world size |
 | Search waypoint vector | 2 | Zero once found; toward the waypoint cell |
 | Other drones | 4 | Relative positions, nearest first, clipped to ±3 m and divided by 3 |
@@ -105,6 +117,8 @@ Each drone receives one observation row. For three drones the row has 126 values
 
 The policy is a feed-forward network without memory. Obstacles outside the rays are forgotten; the searched map is the only record of past search.
 
+`env.observe_search_map=false` replaces own position and the searched map with zeros. It is an ablation switch: hiding the map raised the found rate and lowered the success rate (LOG 2026-11-14.11).
+
 ## 5. Reward
 
 Each term is computed per drone per step. The environment reports the mean over drones; training gives each drone its own reward.
@@ -113,16 +127,18 @@ Each term is computed per drone per step. The environment reports the mean over 
 |---|---|---|---|
 | `progress` | Mean decrease in distance to the target | 2.0 | After detection |
 | `exploration` | Newly searched cells, credit shared between drones | 2.0 | Before detection |
-| `search_waypoint` | Decrease in centroid distance to the current waypoint | 1.0 | Before detection |
+| `search_waypoint` | Decrease in the drone's own distance to the current waypoint | 2.0 | Before detection |
 | `target_found` | One-time bonus on first detection | 70.0 | At detection |
-| `cohesion` | Distance beyond the cohesion radius (2.0 m before detection, 1.0 m after) | 0.5 | Always |
-| `formation` | Mean error of pairwise distances against the initial triangle | 0.75 | After detection |
+| `cohesion` | Distance beyond the cohesion radius (1.0 m in both phases; `search_cohesion_radius` sets the value before detection) | 0.5 | Always |
+| `formation` | Mean error of pairwise distances against the initial triangle | 0.75 (`search_formation_weight` before detection, `formation_weight` after) | Always |
 | `separation` | Surface gap below 0.3 m | 1.0 | Always |
 | `obstacle_proximity` | Clearance below 1.0 m | 1.0 | Always |
 | `wall_proximity` | Clearance below 1.0 m from walls | 3.0 | Always |
 | `step` | Constant cost per step | 0.01 | Always |
 | `collision` | One-time penalty | 10.0 | On collision |
 | `success` | One-time bonus | 50.0 | On success |
+
+Formation and cohesion are shaped the same way in both phases, so the swarm reaches the target already grouped. When search let the swarm spread out, the formation penalty that started at detection was about five times the progress reward, and success after detection fell from 74% to 19% as the spread grew (LOG 2026-11-14.9). `search_waypoint` has the same form and weight as `progress`, so flying to the waypoint is rewarded like flying to the target.
 
 Current behaviour: the collision penalty applies to every drone, not only the one that crashed. See [LOG.md](LOG.md) for open items.
 
@@ -133,8 +149,9 @@ Defaults from `config.py`:
 | Parameter | Default |
 |---|---|
 | Learning rate | 3e-4 |
+| Learning-rate schedule (`ppo.lr_schedule`) | `constant`; stages 3 to 5 set `linear` (falls to 0 over the run) |
 | Environments | 4 (separate processes when above 1) |
-| Steps per environment per update | 256 |
+| Steps per environment per update | 512 |
 | Minibatch | 192 drone samples |
 | Epochs | 10 |
 | Discount, GAE lambda, clip range | 0.99, 0.95, 0.2 |
@@ -144,7 +161,9 @@ Defaults from `config.py`:
 | Reward normalisation | On during training; reported returns are raw |
 | Device (`ppo.device`) | `auto` (GPU if visible, otherwise CPU); set `cpu` or `cuda` explicitly when benchmarking |
 
-One update holds `n_steps × n_envs × num_drones` samples. `run.timesteps` counts environment steps, and SB3 counts one timestep per drone row.
+One update holds `n_steps × n_envs × num_drones` samples: 2,048 environment steps and 6,144 samples by default. `run.timesteps` counts environment steps, and SB3 counts one timestep per drone row.
+
+Keep `n_envs × n_steps` at 2,048. With 1,024 an update holds about five Stage 3 episodes, and the result depended on the training seed: 33% to 88% (LOG 2026-11-14.12 and 2026-11-14.13).
 
 These defaults differ from the reference Stage 1 runs documented in [LOG.md](LOG.md).
 
@@ -156,11 +175,22 @@ Stages are presets in `config.STAGES`. Each stage trains from scratch; there is 
 |---|---|---|---|---|
 | `1_known_fixed` | Navigation and coordination in a fixed layout | Known, fixed | None | 300k |
 | `2_known_random` | Random start and target | Known | None | 500k |
-| `3_search` | Exploration with a hidden target | Hidden | None | 1M |
+| `3_search` | Exploration with a hidden target | Hidden | None | 2M |
 | `4_search_few_obstacles` | Search with 1 to 2 obstacles | Hidden | 1 to 2 | 1M |
 | `5_full` | Everything randomised | Hidden | 3 to 5 | 3M |
 
+Stages 3 to 5 also set `ppo.lr_schedule=linear`.
+
 Move to the next stage only after reliable performance across several training seeds. The proposed gate is about 80% success across at least three seeds.
+
+Status on 2026-11-14 (details in [LOG.md](LOG.md), entries 2026-11-14.8 to 2026-11-14.19):
+
+| Stage | Status |
+|---|---|
+| `1_known_fixed` | 100% on one seed (2026-11-05); not re-run since |
+| `2_known_random` | 100% on two seeds on 2026-11-05. On the current code two of three seeds fail (37% to 98%). Open issue, LOG 2026-11-14.15. |
+| `3_search` | 94%, 93% and 95% on three seeds at 2M steps. Passes the gate. |
+| `4_search_few_obstacles`, `5_full` | Not run with the current settings |
 
 ## 8. Running
 
@@ -227,7 +257,8 @@ Training can run in two places. Both write to the same `runs/` folder.
 | CPU cores | 2 (limit of the `interactive` partition on wICE) | 9 by default (`cluster/train_cpu.slurm`); up to 72 on a `batch` node |
 | Parallel environments | `ppo.n_envs` 4 by default, which overloads the 2 cores | `ppo.n_envs = cores - 1` (8 by default) |
 | Measured training speed (Stage 3) | about 800 environment steps/s | about 1,560 environment steps/s |
-| 1M-step Stage 3 run | about 21 min of training | about 11 min of training |
+| 1M environment steps (Stage 3) | about 21 min of training | about 11 min of training |
+| Stage 3 preset (2M steps), whole job | not measured | 22 to 28 min, 490 to 600 credits |
 | Ends when | You close the terminal or the session times out | The job finishes, independent of your terminal |
 | Use for | Editing code, smoke tests (`--timesteps 2000`), reading reports | Every real experiment, and several seeds at once |
 
@@ -242,7 +273,7 @@ Training can run in two places. Both write to the same `runs/` folder.
 | `cluster/progress.py` | New. Prints how far a running training is (section 10.4). |
 | `config.py`, `training.py` | New option `ppo.device`, used to choose CPU or GPU. |
 
-`cluster/train_cpu.slurm` sets `ppo.n_envs` to the number of cores minus one; the remaining core runs PPO itself. It also sets `ppo.n_steps = 1024 / n_envs`, so each PPO update still holds 1,024 environment steps, as with the defaults (4 × 256). More cores then make training faster without changing the amount of data per update. Any `--set` you pass overrides these values. The job also runs Python unbuffered (`python -u`), so its log file shows progress lines as they happen.
+`cluster/train_cpu.slurm` sets `ppo.n_envs` to the number of cores minus one; the remaining core runs PPO itself. It also sets `ppo.n_steps = 2048 / n_envs` (256 with 9 cores), so each PPO update still holds 2,048 environment steps, as with the defaults (4 × 512). More cores then make training faster without changing the amount of data per update. Until 2026-11-14 the script used 1,024 steps per update, which made Stage 3 depend on the training seed (LOG 2026-11-14.13). Any `--set` you pass overrides these values. The job also runs Python unbuffered (`python -u`), so its log file shows progress lines as they happen.
 
 **Interactive run.** From the project folder in the interactive terminal:
 
@@ -266,8 +297,14 @@ sbatch cluster/train_cpu.slurm --stage 3_search --name search --seed 42 --no-gif
 Several seeds in parallel, one job each. `compare_runs.py` groups runs that share a `--name`:
 
 ```bash
-for s in 42 43 44; do sbatch cluster/train_cpu.slurm --stage 3_search --name search --seed $s --no-gif; done
+prev=""
+for s in 42 43 44; do
+  prev=$(sbatch --parsable ${prev:+--dependency=after:${prev%%;*}+1} \
+         cluster/train_cpu.slurm --stage 3_search --name search --seed $s --no-gif)
+done
 ```
+
+Run folders are named by start time to the second. Two jobs with the same `--name` that start in the same second would create the same folder, and the second one fails. The `--dependency=after:<jobid>+1` option starts each job at least one minute after the previous one has started. Jobs with different names need no chain.
 
 Options for `sbatch` go before the script name, for example `sbatch --cpus-per-task=17 --time=08:00:00 cluster/train_cpu.slurm ...`; `ppo.n_envs` and `ppo.n_steps` follow the core count automatically. `sbatch --test-only cluster/train_cpu.slurm ...` shows the estimated start time without submitting.
 
@@ -334,11 +371,15 @@ As a batch job on a wICE A100 instead: `sbatch cluster/train_gpu.slurm --stage 3
 
 ## 11. Known limitations
 
-- Results rest on single training seeds; use several seeds before drawing conclusions.
+- Stage 3 results rest on three seeds at 2M steps and five at 1M; other stages on one to three. Use several seeds before drawing conclusions.
+- Stage 2 does not reproduce its earlier 100% on the current code: two of three seeds end with the swarm hovering just outside the success radius (LOG 2026-11-14.15).
+- About 5% of Stage 3 episodes end in a drone collision, most of them during the final approach to the target.
+- Stages 4 and 5 have not been run with the search frame and the linear learning-rate schedule. The search waypoint ignores obstacles.
+- Models trained before 2026-11-14 keep the same observation size (126) but were trained with a different frame and map, so they cannot be evaluated in the current environment.
 - No periodic checkpoints or resume after interruption.
 - The policy has no memory beyond the searched map.
 - No automated unit or integration test suite.
-- Multi-process training runs on the cluster (`n_envs=8` in batch jobs, 2026-11-14), but learning with `n_steps=128` has not been compared against the 4 × 256 setting.
+- Run folders are named by start time to the second; same-name jobs that start in the same second collide (section 10.3).
 - The collision penalty applies to all drones; see [LOG.md](LOG.md).
 
 ## 12. Glossary
@@ -349,5 +390,8 @@ As a batch job on a wICE A100 instead: `sbatch cluster/train_gpu.slurm --stage 3
 - **PPO:** a clipped policy-gradient algorithm.
 - **Terminated vs truncated:** terminated means success or collision; truncated means the time limit was reached.
 - **Deterministic evaluation:** the policy uses its mean action with no sampling noise.
-- **Searched map:** a grid of cells marked once a drone has covered them.
-- **Frame:** each drone's axes, rotated so that $+x$ points at the target after detection.
+- **Searched map:** a grid of cells marked once a drone has covered them. Cells that cannot contain the target start as marked.
+- **Waypoint:** the unsearched map cell nearest the swarm centroid; the swarm's current search goal.
+- **Frame:** the rotated axes used for observed vectors and actions. $+x$ points at the current goal: the waypoint during search (one shared frame), the target after detection (one frame per drone). See section 4.2.
+- **Found rate:** share of episodes in which the target is detected.
+- **Conversion:** share of the episodes with the target found that end in success.

@@ -9,6 +9,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.logger import configure
+from stable_baselines3.common.utils import LinearSchedule
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 
 from config import Config
@@ -123,7 +124,7 @@ def train(cfg: Config, run_dir: Path, console: bool = True):
     model = PPO(
         "MlpPolicy",
         env,
-        learning_rate=p.learning_rate,
+        learning_rate=LinearSchedule(p.learning_rate, 0.0, 1.0) if p.lr_schedule == "linear" else p.learning_rate,
         n_steps=p.n_steps,
         batch_size=p.batch_size,
         n_epochs=p.n_epochs,

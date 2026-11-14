@@ -7,6 +7,8 @@
 #
 # Several seeds in parallel, one job each (compare_runs.py groups them by --name):
 #   for s in 42 43 44; do sbatch cluster/train_cpu.slurm --stage 3_search --name search --seed $s --no-gif; done
+# Jobs with the same --name that start in the same second create the same run folder and the second one fails;
+# README 10.3 has a version of this loop that starts them one minute apart.
 #
 # More cores: sbatch --cpus-per-task=17 cluster/train_cpu.slurm ...  (n_envs follows automatically)
 # Check the queue with `squeue -M wice -u $USER`; output goes to slurm-<jobid>.out in the submit folder.
@@ -30,10 +32,10 @@ export XDG_CACHE_HOME="$VSC_SCRATCH/.cache" MPLCONFIGDIR="$VSC_SCRATCH/.cache/ma
 mkdir -p "$MPLCONFIGDIR"
 
 # One core for the PPO process, one per environment process.
-# n_steps is scaled so n_envs * n_steps stays 1024 environment steps per update (as with the defaults 4 x 256),
+# n_steps is scaled so n_envs * n_steps stays 2048 environment steps per update (as with the defaults 4 x 512),
 # so more cores give speed without changing the learning dynamics. A later --set in "$@" overrides either value.
 N_ENVS=$(( SLURM_CPUS_PER_TASK - 1 ))
-N_STEPS=$(( 1024 / N_ENVS ))
+N_STEPS=$(( 2048 / N_ENVS ))
 echo "Host: $(hostname)   Job: $SLURM_JOB_ID   CPUs: $SLURM_CPUS_PER_TASK   n_envs: $N_ENVS   n_steps: $N_STEPS"
 
 python -u run_experiment.py --set ppo.device=cpu ppo.n_envs=$N_ENVS ppo.n_steps=$N_STEPS "$@"
