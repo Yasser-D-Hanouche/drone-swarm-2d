@@ -156,7 +156,7 @@ Defaults from `config.py`:
 | Learning-rate schedule (`ppo.lr_schedule`) | `constant`; stages 3 to 5 set `linear` (falls to 0 over the run) |
 | Environments | 4 (separate processes when above 1) |
 | Steps per environment per update | 512 |
-| Minibatch | 192 drone samples |
+| Minibatch (`ppo.batch_size`) | 768 drone samples, so 80 gradient steps per update (192 and 320 until 2026-11-15) |
 | Epochs | 10 |
 | Discount, GAE lambda, clip range | 0.99, 0.95, 0.2 |
 | Entropy coefficient | 0.005 |
@@ -166,6 +166,12 @@ Defaults from `config.py`:
 | Device (`ppo.device`) | `auto` (GPU if visible, otherwise CPU); set `cpu` or `cuda` explicitly when benchmarking |
 
 One update holds `n_steps × n_envs × num_drones` samples: 2,048 environment steps and 6,144 samples by default. `run.timesteps` counts environment steps, and SB3 counts one timestep per drone row.
+
+**Gradient steps per update: 80, not 320.** Each update makes 10 passes (epochs) over its 6,144 samples, in minibatches of `ppo.batch_size`. With 768 that is 8 minibatches per epoch, so **80 gradient steps per update**. Until 2026-11-15 the minibatch was 192: 32 per epoch, 320 gradient steps.
+
+- Why it changed: each gradient step has a fixed Python and PyTorch overhead that dominates the tiny [64, 64] network, so the update took about 0.83 s and was the floor of the training time. With 768 it takes about 0.28 s ([PPO_inner_workings.md](PPO_inner_workings.md)).
+- Effect: a 2M-step run trains in 10 to 22 minutes instead of 19 to 26, at about 40% fewer credits. All three Stage 3 and all three Stage 4 seeds still pass the gate (LOG 2026-11-15.4). Stage 3 is unchanged (mean 93% against 94%); Stage 4 is a few points lower (mean 85% against 89%, within the noise of 100 episodes).
+- **For the later stages it may be smart to go back to 320** (`--set ppo.batch_size=192`). The smaller steps scored slightly higher on Stage 4, and Stage 5 with 3 to 5 obstacles is likely to need every point. The price is about 8 to 15 more minutes of training per run.
 
 Keep `n_envs × n_steps` at 2,048. With 1,024 an update holds about five Stage 3 episodes, and the result depended on the training seed: 33% to 88% (LOG 2026-11-14.12 and 2026-11-14.13).
 
@@ -187,14 +193,14 @@ Stages 3 to 5 also set `ppo.lr_schedule=linear`.
 
 Move to the next stage only after reliable performance across several training seeds. The proposed gate is about 80% success across at least three seeds.
 
-Status on 2026-11-15 (details in [LOG.md](LOG.md), entries 2026-11-14.8 to 2026-11-15.3):
+Status on 2026-11-15 (details in [LOG.md](LOG.md), entries 2026-11-14.8 to 2026-11-15.5):
 
 | Stage | Status |
 |---|---|
 | `1_known_fixed` | 100% on one seed (2026-11-05); not re-run since |
 | `2_known_random` | 100% on two seeds on 2026-11-05. On the current code two of three seeds fail (37% to 98%). Open issue, LOG 2026-11-14.15. |
-| `3_search` | 94%, 93% and 95% on three seeds at 2M steps. Passes the gate. |
-| `4_search_few_obstacles` | 90%, 84% and 93% on three seeds at 2M steps (Greedy 92% to 93%). Passes the gate. |
+| `3_search` | 94%, 93% and 95% on three seeds at 2M steps with 320 gradient steps per update; 94%, 91% and 93% with the current 80. Passes the gate. |
+| `4_search_few_obstacles` | 90%, 84% and 93% on three seeds at 2M steps with 320 gradient steps per update (Greedy 92% to 93%); 84%, 87% and 83% with the current 80. Passes the gate. |
 | `5_full` | Not run with the current settings |
 
 ## 8. Running
@@ -259,11 +265,11 @@ Training can run in two places. Both write to the same `runs/` folder.
 | | Interactive session | Batch job (`sbatch`) |
 |---|---|---|
 | What it is | A shell on a compute node that you type into | A script queued by Slurm; it runs on its own node without a terminal |
-| CPU cores | 2 (limit of the `interactive` partition on wICE) | 9 by default (`cluster/train_cpu.slurm`); up to 72 on a `batch` node |
-| Parallel environments | `ppo.n_envs` 4 by default, which overloads the 2 cores | `ppo.n_envs = cores - 1` (8 by default) |
-| Measured training speed (Stage 3) | about 800 environment steps/s | about 1,560 environment steps/s |
-| 1M environment steps (Stage 3) | about 21 min of training | about 11 min of training |
-| Stage 3 preset (2M steps), whole job | not measured | 22 to 28 min, 490 to 600 credits |
+| CPU cores | 2 (limit of the `interactive` partition on wICE) | 9 by default (`cluster/train_cpu.slurm`); 17 recommended for Stage 4 and later (`--cpus-per-task=17`); up to 72 on a `batch` node |
+| Parallel environments | `ppo.n_envs` 4 by default, which overloads the 2 cores | `ppo.n_envs = cores - 1` (8 with 9 cores, 16 with 17) |
+| Measured training speed (Stage 3, minibatch 192) | about 800 environment steps/s | about 1,560 environment steps/s (9 cores) |
+| Stage 3 preset (2M steps), whole job, minibatch 768 | not measured | 14 to 23 min, 310 to 500 credits (9 cores) |
+| Stage 4 preset (2M steps), whole job, minibatch 768 | not measured | 11 to 14 min, 470 to 590 credits (17 cores) |
 | Ends when | You close the terminal or the session times out | The job finishes, independent of your terminal |
 | Use for | Editing code, smoke tests (`--timesteps 2000`), reading reports | Every real experiment, and several seeds at once |
 
@@ -288,32 +294,52 @@ source .venv/bin/activate
 python run_experiment.py --stage 3_search --timesteps 2000 --episodes 3 --no-gif --name smoke --set ppo.n_envs=2
 ```
 
-Use `ppo.n_envs=1` or `2` here so the processes do not exceed the 2 cores.
+Use `ppo.n_envs=1` or `2` here so the processes do not exceed the 2 cores. Use the interactive session only for such smoke tests; real training runs as a batch job (section 10.3).
 
 ### 10.3 Running a batch job (recommended for training)
 
-Submit from any terminal in the project folder. Everything after the script name goes to `run_experiment.py`:
+Every real training run goes through `sbatch cluster/train_cpu.slurm`, not through `python run_experiment.py` in the interactive terminal. You do not activate a venv or start Python yourself: the script loads the Python module, activates `.venv`, sets `ppo.device=cpu`, `ppo.n_envs` and `ppo.n_steps` from the core count, and calls `run_experiment.py`.
 
-```bash
-cd /data/leuven/394/vsc39468/drone-swarm
-sbatch cluster/train_cpu.slurm --stage 3_search --name search --seed 42 --no-gif
-```
+Step by step:
 
-Several seeds in parallel, one job each. `compare_runs.py` groups runs that share a `--name`:
+1. Open any terminal on the VSC (the interactive session is fine) and go to the project folder:
 
-```bash
-prev=""
-for s in 42 43 44; do
-  prev=$(sbatch --parsable ${prev:+--dependency=after:${prev%%;*}+1} \
-         cluster/train_cpu.slurm --stage 3_search --name search --seed $s --no-gif)
-done
-```
+   ```bash
+   cd /data/leuven/394/vsc39468/drone-swarm
+   ```
+
+2. Submit. Options for Slurm (`--cpus-per-task`, `--time`) go **before** the script name; everything **after** it goes to `run_experiment.py` (`--stage`, `--name`, `--seed`, `--episodes`, `--no-gif`, `--set ...`).
+
+   ```bash
+   # Stage 3: 9 cores (the script default)
+   sbatch --time=00:50:00 cluster/train_cpu.slurm --stage 3_search --name search --seed 43 --episodes 100 --no-gif
+
+   # Stage 4: 17 cores
+   sbatch --cpus-per-task=17 --time=00:50:00 cluster/train_cpu.slurm \
+          --stage 4_search_few_obstacles --name s4 --seed 42 --episodes 100
+   ```
+
+   Leave out `--no-gif` to get `episode_first.gif` and `episode_failure.gif` (about 1 minute more). `sbatch` prints the job ID; the job's console output goes to `slurm-<jobid>.out` in the project folder.
+
+3. Three seeds at once, one job each. Runs that share a `--name` are grouped as seeds by `compare_runs.py`:
+
+   ```bash
+   prev=""
+   for s in 42 43 44; do
+     prev=$(sbatch --parsable --cpus-per-task=17 --time=00:50:00 ${prev:+--dependency=after:${prev%%;*}+1} \
+            cluster/train_cpu.slurm --stage 4_search_few_obstacles --name s4 --seed $s --episodes 100)
+   done
+   ```
+
+4. Follow the jobs (section 10.4), then read `runs/<timestamp>_<name>/report.md`. Compare seeds with `python compare_runs.py --last 3 --md` (with `.venv` active).
+
+5. To use 320 gradient steps per update instead of the default 80 (section 6), add `--set ppo.batch_size=192` after the script name.
 
 Run folders are named by start time to the second. Two jobs with the same `--name` that start in the same second would create the same folder, and the second one fails. The `--dependency=after:<jobid>+1` option starts each job at least one minute after the previous one has started. Jobs with different names need no chain.
 
 Options for `sbatch` go before the script name, for example `sbatch --cpus-per-task=17 --time=08:00:00 cluster/train_cpu.slurm ...`; `ppo.n_envs` and `ppo.n_steps` follow the core count automatically. `sbatch --test-only cluster/train_cpu.slurm ...` shows the estimated start time without submitting.
 
-More cores give diminishing returns. The PPO gradient update runs in one process and takes about 1 s per update whatever the core count; only the environment stepping is parallel. Stage 4, 200k-step benchmark (LOG 2026-11-14.23):
+More cores give diminishing returns. The PPO gradient update runs in one process whatever the core count (about 1 s per update with minibatch 192, about 0.3 s with 768); only the environment stepping is parallel. Stage 4, 200k-step benchmark with minibatch 192 (LOG 2026-11-14.23):
 
 | Cores | `n_envs` × `n_steps` | Environment steps/s | 2M steps of training | Core-minutes for 2M steps |
 |---|---|---|---|---|
@@ -322,6 +348,8 @@ More cores give diminishing returns. The PPO gradient update runs in one process
 | 33 | 32 × 64 | 1,911 | about 17.5 min | about 577 |
 
 The Stage 4 runs used `--cpus-per-task=17`: 25% faster than 9 cores for about 1.5 times the credits. 33 cores costs 2.5 times the credits for 1.5 times the speed, and its 64-step rollout segments are untested. The script default stays at 9.
+
+The jobs use only about 20% of the cores they reserve (`seff <jobid>`). Each environment step costs under 1 ms; the environment processes then wait for the main process, which gathers the observations, runs the network and sends the actions back. With minibatch 768 this per-step work in the main process is the bottleneck, so more cores would not make runs faster (LOG 2026-11-15.4).
 
 Each job writes its console output to `slurm-<jobid>.out` in the project folder and its results to `runs/<timestamp>_<name>/`. The run folder is printed as `/vsc-hard-mounts/leuven-data/...`: that is the real path behind `/data/leuven/...`, which is a symbolic link to it. It is the same folder.
 

@@ -90,7 +90,7 @@ class PPOConfig:
     lr_schedule: str = "constant"      # "constant", or "linear": learning_rate falls linearly to 0 over the run, which settles the policy late in training
     n_envs: int = 4                    # parallel environments (separate processes if > 1); n_steps below is per environment
     n_steps: int = 512                 # rollout length per environment per update; n_envs * n_steps = environment steps per update (keep 2048: 1024 holds too few episodes per update and made Stage 3 seed-dependent)
-    batch_size: int = 192              # minibatch of drone samples; one update holds n_steps * n_envs * num_drones samples (6144 by default)
+    batch_size: int = 768              # minibatch of drone samples; one update holds n_steps * n_envs * num_drones samples (6144 by default), so 768 gives 8 minibatches per epoch and 80 gradient steps per update (192 gave 320)
     n_epochs: int = 10
     gamma: float = 0.99                # discount; 0.99 looks ~100 steps (10 s) ahead
     gae_lambda: float = 0.95

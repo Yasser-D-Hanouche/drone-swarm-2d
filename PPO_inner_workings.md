@@ -33,12 +33,12 @@ PPO repeats two phases about 977 times in a 2M-step run:
 | Advantage | For each sample, how much better than expected things went. Computed with the discount (γ = 0.99) and the GAE factor (λ = 0.95). | One per sample |
 | Update | One round of collect, score, optimise, then discard the data | 2M ÷ 2,048 ≈ 977 per run |
 | Epoch | One pass over all 6,144 samples of a rollout, in shuffled order | 10 per update |
-| Minibatch | A slice of the samples used for one gradient step | 192 samples; 32 per epoch |
-| Gradient step | One small change of the network weights, computed from one minibatch | 32 × 10 = 320 per update |
+| Minibatch | A slice of the samples used for one gradient step (`ppo.batch_size`) | 768 samples; 8 per epoch (until 2026-11-15: 192 samples, 32 per epoch) |
+| Gradient step | One small change of the network weights, computed from one minibatch | 8 × 10 = **80 per update** (until 2026-11-15: 32 × 10 = 320) |
 
 What one gradient step does:
 
-1. Run the 192 samples through the network.
+1. Run the 768 samples of the minibatch through the network.
 2. Compute the loss:
    - a policy term: do more of what went better than expected, but clipped (`clip_range` 0.2) so one update cannot move the policy too far;
    - a value term: predict returns better;
@@ -56,22 +56,23 @@ The three drones are a team. The network is the team's playbook: a set of habits
 | Rollout | Play with the current playbook while a camera records: 6,144 frames of footage |
 | Update | One "play, then review" cycle. Play, study the footage, improve the playbook, go back out. The old footage is thrown away, because it shows habits the team no longer has. |
 | Epoch | Watching all the footage once. The team watches it 10 times, but a rule (clipping) forbids overhauling the playbook based on one tape. |
-| Gradient step | The footage is cut into clips of 192 frames. After each clip the team makes one small correction: "in situations like these, lean a little more toward what worked and away from what didn't." |
+| Gradient step | The footage is cut into clips of 768 frames. After each clip the team makes one small correction: "in situations like these, lean a little more toward what worked and away from what didn't." |
 
 ```
 Training run (2M steps)
 └── 977 updates ("play, then review" cycles)
     ├── Play: collect 6,144 frames of footage
     └── Review: watch it 10 times (10 epochs)
-        └── each viewing: 32 clips of 192 frames
+        └── each viewing: 8 clips of 768 frames   (until 2026-11-15: 32 clips of 192)
             └── after each clip: 1 small correction (gradient step)
+                → 80 corrections per review       (until 2026-11-15: 320)
 ```
 
 ## 4. Why Python overhead dominates
 
 One gradient step involves a few dozen PyTorch operations: the network layers, log-probabilities, the probability ratio, clipping, the losses, the backward pass, gradient clipping and the Adam step. Each operation has a fixed launch cost in Python and PyTorch's dispatcher, a few microseconds to tens of microseconds, regardless of the size of the data. The arithmetic itself is tiny: 192 samples through a 64-wide network take microseconds.
 
-So most of the measured 0.83 s per update (about 2.6 ms per gradient step × 320) is bookkeeping, not maths. In the analogy, every correction comes with a fixed amount of admin (rewind, pause, take notes, edit the playbook), and the clips are so short that the admin takes longer than the watching.
+So most of the measured 0.83 s per update with 320 gradient steps (about 2.6 ms per step) is bookkeeping, not maths. In the analogy, every correction comes with a fixed amount of admin (rewind, pause, take notes, edit the playbook), and the clips were so short that the admin took longer than the watching. With clips of 768 frames (80 corrections) an update takes 0.28 s.
 
 Consequences:
 
@@ -79,9 +80,9 @@ Consequences:
 - **A GPU does not help** for the same reason, and adds a transfer to and from the card on every step (LOG 2026-11-14.5).
 - **More cores help only the environment stepping,** which already runs in parallel processes.
 
-## 5. Where the 25 to 35 minutes go
+## 5. Where the 25 to 35 minutes went (320 gradient steps per update)
 
-Stage 4, 2M steps, 17 cores:
+Stage 4, 2M steps, 17 cores, minibatch 192:
 
 | Part | Time | Notes |
 |---|---|---|
@@ -102,7 +103,13 @@ The updates are the floor: even with unlimited cores, training takes at least ab
 | 4 | Fewer epochs (`ppo.n_epochs` 10 to 5) | Halves the update time | Yes | Validation; do not combine with option 1 in the same test |
 | 5 | Batched environment (all environments as one numpy array in one process) | Attacks only the 5-minute environment part | No | Large rewrite; not worth it now |
 
-Recommendation: option 2 (free) together with option 1 (validated on 2 to 3 seeds). Expected total: about 9 to 10 minutes of training plus about 3 minutes of evaluation, so 12 to 13 minutes per run. If larger minibatches lower success, fall back to option 3. None of these has been applied yet.
+**Applied on 2026-11-15: option 1** (`ppo.batch_size` 768, so 80 gradient steps per update). Tested on the three Stage 3 and three Stage 4 seeds that had passed with 320 (LOG 2026-11-15.4):
+
+- Stage 4 jobs now take 11 to 14 minutes in total (training 10.0 to 12.6 min, previously 18.7 to 25.8). Stage 3 training took 13.2 to 21.8 min (previously 21.5 to 26.4). Credits fell by about 40%.
+- All six runs still pass the gate. Stage 3: 94%, 91%, 93% (before 94%, 95%, 93%). Stage 4: 84%, 87%, 83% (before 90%, 84%, 93%), a few points lower on average but within the noise of 100 episodes.
+- **For the later stages it may be smart to go back to 320 gradient steps** (`--set ppo.batch_size=192`), or to test 384 (160 steps), for a potentially higher success rate at the cost of about 8 to 15 more minutes per run.
+
+Options 2 to 5 have not been applied. With the cheaper update, the next limit is the main process during data collection: the jobs use only about 20% of their reserved cores, because the environment processes wait for the main process to gather observations, run the network and send back actions.
 
 ## 7. Practical note: a new run folder does not appear in VS Code
 
@@ -115,10 +122,10 @@ A batch job creates its run folder within seconds of starting (for example, job 
 
 ---
 
-*Written 2026-11-15.*
+*Written 2026-11-15; updated the same day after the minibatch change.*
 
 *Project status at the time of writing:*
 
-- *Branch: `martin-branch`. Latest commit: `0dbcaa8` ("Stage 4 done. Gifs and trajectory generation need to be changed").*
-- *Uncommitted changes: `LOG.md` and `README.md` (Stage 4 entry and one corrected sentence), `diagnostics.py` and `run_experiment.py` (per-episode trajectory panels with each episode's obstacles; GIFs with true-size drones, rays, searched map, waypoint and target), and this file.*
-- *Curriculum: Stage 3 passes the gate (94%, 93%, 95% on three seeds). Stage 4 passes the gate: 90%, 84% and 93% on three seeds at 2M steps (the third, seed 44, is run `20261115_113213_s4_mask`, with GIFs). Stage 5 has not been run with the current settings.*
+- *Branch: `martin-branch-test`, based on commit `e9e3d8b` ("3rd Seed (Seed 44) passed…"), which is also the latest commit on `martin-branch`.*
+- *Uncommitted changes on `martin-branch-test`: `config.py` (`ppo.batch_size` 192 to 768), `README.md`, `LOG.md` and this file.*
+- *Curriculum: Stages 3 and 4 pass the gate on three seeds, both with 320 and with 80 gradient steps per update. Stage 5 has not been run with the current settings.*

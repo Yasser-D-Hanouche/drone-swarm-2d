@@ -11,7 +11,7 @@
 # README 10.3 has a version of this loop that starts them one minute apart.
 #
 # More cores: sbatch --cpus-per-task=17 cluster/train_cpu.slurm ...  (n_envs follows automatically)
-# Check the queue with `squeue -M wice -u $USER`; output goes to slurm-<jobid>.out in the submit folder.
+# Check the queue with `squeue -M wice -u $USER`; output goes to logs/slurm-<jobid>.out (submit from the project folder; logs/ must exist, it is kept in git with logs/.gitkeep).
 #
 #SBATCH --job-name=drone-ppo-cpu
 #SBATCH --clusters=wice
@@ -21,7 +21,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=9
 #SBATCH --time=04:00:00
-#SBATCH --output=slurm-%j.out
+#SBATCH --output=logs/slurm-%j.out
 
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"

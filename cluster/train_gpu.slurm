@@ -5,7 +5,7 @@
 #   sbatch cluster/train_gpu.slurm --stage 3_search --name search --seed 42 --no-gif
 #   sbatch --time=04:00:00 cluster/train_gpu.slurm --stage 3_search --seed 43 --set ppo.n_envs=8
 #
-# Check the queue with `squeue -M wice -u $USER`; output goes to slurm-<jobid>.out in the submit folder.
+# Check the queue with `squeue -M wice -u $USER`; output goes to logs/slurm-<jobid>.out (submit from the project folder; logs/ must exist, it is kept in git with logs/.gitkeep).
 # For an H100 instead: sbatch --partition=gpu_h100 cluster/train_gpu.slurm ...
 # Do NOT use the P100/V100 partitions: the CUDA 13 torch build in .venv-gpu does not support them.
 #
@@ -18,7 +18,7 @@
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=9
 #SBATCH --time=02:00:00
-#SBATCH --output=slurm-%j.out
+#SBATCH --output=logs/slurm-%j.out
 
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"

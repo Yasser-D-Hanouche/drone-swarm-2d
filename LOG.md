@@ -11,7 +11,7 @@ Commit history: this workspace has no `.git` folder, so per-commit hashes are no
 - [2026-11-14: GPU environment](#2026-11-14-gpu-environment)
 - [2026-11-14 (evening): Stage 3 diagnosis and fix](#2026-11-14-evening-stage-3-diagnosis-and-fix)
 - [2026-11-14 (night): Stage 4, obstacles](#2026-11-14-night-stage-4-obstacles)
-- [2026-11-15: Stage 4 visuals and third seed](#2026-11-15-stage-4-visuals-and-third-seed)
+- [2026-11-15: Stage 4 visuals, third seed, and 80 gradient steps per update](#2026-11-15-stage-4-visuals-and-third-seed)
 
 ---
 
@@ -595,7 +595,7 @@ Findings:
 - Stage 2 fails on two of three seeds under both batch settings. The regression is not caused by the changes of this entry: the Stage 2 environment is identical step for step, and the setting used before this entry fails the same seeds.
 - Failure mode, the same in every failing run: the swarm arrives and hovers just outside the success radius. In `20261114_212344_s2_check` the timeouts ended with the swarm centre 0.75 m from the target, the worst drone at 1.06 m (success needs below 0.8 m), and a formation error of 0.08 m.
 - Learning starts late. The runs above have 0% training success for the first 150k to 400k steps. In `20261114_212344_s2_check`, 93% to 99% of the episodes in the first 150k steps ended in a drone collision. The 2026-11-05 run had 25% success in its first 100k steps and 95% in the second.
-- Changes between the 2026-11-05 run (code snapshot in `runs/20261105_110151_stage2_random_seed42`) and the code before this entry that affect Stage 2:
+- Changes between the 2026-11-05 run (code snapshot in `runs/20261105_110151_stage2_random_seed42`, deleted on 2026-11-15 with the other runs from before 2026-11-14) and the code before this entry that affect Stage 2:
   - The collision penalty changed from the drones that caused the crash to every drone.
   - `reward.formation_weight` 0.5 to 0.75, `ppo.ent_coef` 0.0 to 0.005, default `ppo.n_steps` 512 to 256.
   - The observation gained two entries for the waypoint, which are zero in Stage 2.
@@ -836,5 +836,30 @@ What the GIFs and the trajectory panels show:
 
 1. **Stage 5** (3 to 5 obstacles, 3M steps), three seeds. Watch the obstacle crashes during search in the report and the failure GIFs. If they dominate, test a waypoint frame that routes around inflated obstacles (a design decision to make together).
 2. **Rays that report what they hit**: untested idea; candidate for Stage 5.
-3. **Shorter runs** (`PPO_inner_workings.md` section 6): larger minibatches (`ppo.batch_size` 768) validated on 2 to 3 seeds, plus less periodic evaluation; or a warm start from the previous stage.
+3. **Shorter runs** (`PPO_inner_workings.md` section 6): larger minibatches (`ppo.batch_size` 768) validated on 2 to 3 seeds, plus less periodic evaluation; or a warm start from the previous stage. Done for the minibatch in 2026-11-15.4.
 4. Open items from 2026-11-14.19 remain.
+
+### 2026-11-15.4 Minibatch 768: 80 gradient steps per update instead of 320
+
+Branch: `martin-branch-test`, from commit e9e3d8b.
+
+- **Change:** `config.py`, `PPOConfig.batch_size` 192 to 768. An update still holds 6,144 samples and 10 epochs, so it now makes 8 minibatches per epoch and **80 gradient steps per update instead of 320**. Nothing else changed.
+- **Motivation:** the update was the floor of the training time (about 1 s per update, 977 updates per 2M-step run, in one process). Most of it is fixed per-step overhead of Python and PyTorch, not arithmetic (`PPO_inner_workings.md` sections 4 to 6). Measured: 0.83 s per update with 192, 0.28 s with 768. More torch threads did not help (0.89 s with 2).
+- **Test:** the six runs that passed the gate were repeated with the same seeds and the same core counts (Stage 3: seeds 43, 45, 46 on 9 cores; Stage 4: seeds 42, 43, 44 on 17 cores), all in parallel (jobs 62704570 to 62704575). Run folders `runs/20261115_12*_s3_mb768` and `runs/20261115_12*_s4_mb768`.
+
+| Stage | Success, 320 steps | Success, 80 steps | Training time per run, 320 → 80 steps | Credits, 320 → 80 steps |
+|---|---|---|---|---|
+| 3 | 94%, 95%, 93% | 94%, 91%, 93% | 21.5–26.4 → 13.2–21.8 min | 1,608 → 1,215 |
+| 4 | 90%, 84%, 93% | 84%, 87%, 83% | 18.7–25.8 → 10.0–12.6 min | 2,987 → 1,549 |
+
+- **Effect:** all six runs still pass the gate. Stage 3 is unchanged (mean 93% against 94%). Stage 4 is lower on average (85% against 89%); the confidence intervals overlap on every seed, so 100 episodes per run cannot establish a real loss. Stage 4 jobs now take 11 to 14 minutes in total. Stage 3 saved less (seed 46 only 4.6 minutes); the reason was not determined.
+- **CPU use:** `seff` reports about 20% of the reserved core time used (two jobs report 4% and 9%, which are likely undercounts; `sacct` records no CPU time for these jobs). One environment step costs about 0.85 ms of CPU, and a policy forward pass for 48 rows 0.28 ms. The environment processes wait most of the time for the main process (observation gathering through pipes, inference, bookkeeping). That main-process work per step is now the bottleneck, not the core count. Peak memory: 2.4 GB on 9 cores, 4.4 GB on 17.
+- **Recommendation:** keep 768 for development runs. For the later stages (Stage 5), consider going back to 320 gradient steps (`--set ppo.batch_size=192`) or testing the middle setting 384 (160 steps): Stage 4 scored a few points higher with the smaller steps, and Stage 5 is likely to need them.
+
+### 2026-11-15.5 Next steps
+
+1. **Stage 5** (3 to 5 obstacles, 3M steps), three seeds, on 17 cores. Decide first between minibatch 768 (faster) and 192 (possibly a few points higher; 2026-11-15.4).
+2. **Rays that report what they hit**: untested idea; candidate for Stage 5.
+3. **Housekeeping (done 2026-11-15):** the 11 run folders from before 2026-11-14 (all from 2026-11-05, 19 MB) and all `slurm-*.out` job logs were deleted. Runs from 2026-11-14 onwards are kept; results of the deleted jobs remain summarised in this file.
+4. **Main-process overhead** during data collection is now the speed limit. A short benchmark of 9 against 17 cores with minibatch 768 would show whether fewer cores cost any speed.
+5. Open items from 2026-11-14.19 remain.
