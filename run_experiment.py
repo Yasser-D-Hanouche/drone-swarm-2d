@@ -158,11 +158,11 @@ def main():
         if run.gif:
             print("\n4/4 Recording GIFs")
             ppo_rows = results["PPO"]
-            save_gif(cfg, ppo_rows[0], run_dir / "episode_first.gif", f"PPO seed {ppo_rows[0]['seed']}")
+            save_gif(cfg, ppo_rows[0], run_dir / "episode_first.gif", f"PPO seed {ppo_rows[0]['seed']}", policies["PPO"])
             files.append("episode_first.gif")
             failure = next((r for r in ppo_rows if not r["success"]), None)
             if failure is not None and failure is not ppo_rows[0]:
-                save_gif(cfg, failure, run_dir / "episode_failure.gif", f"PPO seed {failure['seed']}")
+                save_gif(cfg, failure, run_dir / "episode_failure.gif", f"PPO seed {failure['seed']}", policies["PPO"])
                 files.append("episode_failure.gif")
 
         save_json(run_dir / "results.json", {

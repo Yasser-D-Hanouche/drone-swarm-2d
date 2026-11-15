@@ -9,6 +9,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
+from matplotlib.collections import LineCollection
+from matplotlib.patches import Circle, Rectangle
 
 from config import Config
 from environment import OUTCOMES, REWARD_TERMS, DroneSwarm2D, draw_scene
@@ -168,7 +170,36 @@ def summarize(rows):
     }
 
 
+def _plot_trajectories_per_episode(results: dict, cfg: Config, path, n_cols=4):
+    # Random obstacles differ per episode, so episodes cannot share one panel. One panel per episode, drawn with that
+    # episode's own obstacles and target. Every policy is evaluated on the same seeds, so a column is one layout.
+    names = list(results)
+    n_cols = max(1, min(n_cols, min(len(rows) for rows in results.values())))
+    fig, axes = plt.subplots(len(names), n_cols, figsize=(4.2 * n_cols, 4.4 * len(names)), squeeze=False)
+    for i, name in enumerate(names):
+        for j in range(n_cols):
+            ax, r = axes[i][j], results[name][j]
+            draw_scene(ax, cfg.env, r["obstacles"], r["target"])
+            traj = r["traj"]
+            for d in range(traj.shape[1]):
+                color = DRONE_COLORS[d % len(DRONE_COLORS)]
+                ax.plot(traj[:, d, 0], traj[:, d, 1], color=color, alpha=0.8, lw=1)
+                ax.scatter(*traj[0, d], color=color, s=14, zorder=5)
+            if not math.isnan(r["collision_x"]):
+                ax.scatter(r["collision_x"], r["collision_y"], marker="x", color="black", s=60, zorder=6)
+            ax.set_title(f"{name} | seed {r['seed']} | {r['outcome']}", fontsize=9, color=OUTCOME_COLORS[r["outcome"]])
+            ax.set_xlabel("")
+            ax.set_ylabel("")
+    fig.suptitle("Evaluation trajectories, one episode per panel (red = obstacles, star = target, dot = start, x = collision)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=90)
+    plt.close(fig)
+
+
 def plot_trajectories(results: dict, cfg: Config, path, max_episodes=12):
+    if cfg.env.random_obstacles and cfg.env.max_obstacles > 0:
+        _plot_trajectories_per_episode(results, cfg, path)
+        return
     fig, axes = plt.subplots(1, len(results), figsize=(6 * len(results), 6.4), squeeze=False)
     for ax, (name, rows) in zip(axes[0], results.items()):
         first_obs = rows[0]["obstacles"] if (rows and not cfg.env.random_obstacles) else []
@@ -260,27 +291,109 @@ def plot_training(training_rows, eval_curve, total, path):
     plt.close(fig)
 
 
-def save_gif(cfg: Config, row, path, title, fps=15, stride=2, hold=12):
-    traj = row["traj"]
+def record_episode(cfg: Config, policy_factory, seed):
+    """Replay one episode and record, per step, what the GIF draws: positions, rays, searched map, waypoint, found flag.
+
+    The environment and the deterministic evaluation policies are reproducible from the episode seed, so the replay is
+    the same episode as the evaluated one (save_gif checks the positions). Ray ends mark where the drone centre would
+    touch the obstacle, wall or drone, so they stop drone_radius short of the surface.
+    """
+    env = DroneSwarm2D(cfg.env, cfg.reward)
+    env.action_space.seed(seed)
+    policy = policy_factory(env)
+    obs, _ = env.reset(seed=seed)
+    start_searched = env.searched.copy()
+    frames = []
+
+    def snapshot():
+        dist = env._raycast() * cfg.env.vision_range  # (n, rays) in metres
+        angles = env.headings[:, None] + env.ray_offsets[None, :]
+        ends = env.positions[:, None, :] + dist[..., None] * np.stack([np.cos(angles), np.sin(angles)], axis=-1)
+        frames.append({
+            "pos": env.positions.copy(),
+            "ray_start": np.repeat(env.positions[:, None, :], len(env.ray_offsets), axis=1).reshape(-1, 2),
+            "ray_end": ends.reshape(-1, 2),
+            "ray_hit": (dist < cfg.env.vision_range - 1e-6).ravel(),
+            "searched": env.searched.copy(),
+            "waypoint": None if env.search_goal_idx is None else env.cell_centers[env.search_goal_idx].copy(),
+            "found": env.target_found,
+        })
+
+    snapshot()
+    while True:
+        obs, _, terminated, truncated, info = env.step(policy(obs))
+        snapshot()
+        if terminated or truncated:
+            break
+    return {"frames": frames, "start_searched": start_searched, "obstacles": env.obstacles.copy(),
+            "target": env.target.copy(), "cell_centers": env.cell_centers, "outcome": info["termination"]}
+
+
+def save_gif(cfg: Config, row, path, title, policy_factory, fps=15, stride=2, hold=12):
+    """Animate one evaluated episode: drones at true size, their rays, the searched map, the waypoint and the target."""
+    ep = record_episode(cfg, policy_factory, row["seed"])
+    traj = np.stack([f["pos"] for f in ep["frames"]])
+    if traj.shape != row["traj"].shape or not np.allclose(traj, row["traj"], atol=1e-5):
+        print(f"Warning: replay of seed {row['seed']} differs from the evaluated episode; the GIF shows the replay.")
+    c = cfg.env
     frames = list(range(0, len(traj), stride)) + [len(traj) - 1] * hold
-    fig, ax = plt.subplots(figsize=(6, 6))
-    draw_scene(ax, cfg.env, row["obstacles"], row["target"])
+    fig, ax = plt.subplots(figsize=(6.4, 6.9))
+    draw_scene(ax, c, ep["obstacles"], None)
+
+    # Searched map: grey = needs no search from the start (along the walls, around obstacles), blue = searched by the drones.
+    grid = int(np.ceil(c.world_size / c.explore_cell))
+    extent = (0, grid * c.explore_cell, 0, grid * c.explore_cell)
+
+    def map_image(searched):
+        img = np.zeros((len(searched), 4), dtype=np.float32)
+        img[ep["start_searched"]] = (0.6, 0.6, 0.6, 0.25)
+        img[searched & ~ep["start_searched"]] = (0.35, 0.6, 0.95, 0.25)
+        return img.reshape(grid, grid, 4).transpose(1, 0, 2)  # cells are indexed [x, y]; imshow wants [row = y, col = x]
+
+    searched_img = ax.imshow(map_image(ep["frames"][0]["searched"]), origin="lower", extent=extent, zorder=0,
+                             interpolation="nearest")
+    waypoint = Rectangle((0, 0), c.explore_cell, c.explore_cell, fill=False, edgecolor="darkorange", lw=2, zorder=3,
+                         visible=False)
+    ax.add_patch(waypoint)
+    target_zone = Circle(ep["target"], c.success_radius, color="green", alpha=0.08, zorder=1)
+    ax.add_patch(target_zone)
+    target_star = ax.scatter(*ep["target"], color="green", marker="*", s=150, alpha=0.3, zorder=2)
+    rays = LineCollection([], linewidths=0.8, zorder=4)
+    ax.add_collection(rays)
     n = traj.shape[1]
-    dots = [ax.plot([], [], "o", color=DRONE_COLORS[d % len(DRONE_COLORS)], ms=8, zorder=5)[0] for d in range(n)]
-    trails = [ax.plot([], [], color=DRONE_COLORS[d % len(DRONE_COLORS)], alpha=0.6, lw=1.3, zorder=4)[0] for d in range(n)]
-    heading = ax.set_title("")
+    colors = [DRONE_COLORS[d % len(DRONE_COLORS)] for d in range(n)]
+    trails = [ax.plot([], [], color=colors[d], alpha=0.6, lw=1.2, zorder=4)[0] for d in range(n)]
+    bodies = [Circle(traj[0, d], c.drone_radius, color=colors[d], zorder=6) for d in range(n)]
+    for body in bodies:
+        ax.add_patch(body)
+    heading = ax.set_title("", fontsize=10)
+    fig.text(0.5, 0.01, "rays: red = hits something within range, grey = clear | orange square = search waypoint\n"
+             "grey cells = no search needed | blue cells = searched | star = target (faint until found)",
+             ha="center", fontsize=7.5)
 
     def update(k):
         f = frames[k]
+        fr = ep["frames"][f]
+        searched_img.set_data(map_image(fr["searched"]))
+        if fr["waypoint"] is not None:
+            waypoint.set_xy(fr["waypoint"] - c.explore_cell / 2)
+        waypoint.set_visible(fr["waypoint"] is not None)
+        alpha = 1.0 if fr["found"] else 0.3
+        target_star.set_alpha(alpha)
+        target_zone.set_alpha(0.25 if fr["found"] else 0.08)
+        rays.set_segments(np.stack([fr["ray_start"], fr["ray_end"]], axis=1))
+        rays.set_colors(np.where(fr["ray_hit"][:, None], [[0.85, 0.1, 0.1, 0.9]], [[0.5, 0.5, 0.5, 0.35]]))
         for d in range(n):
-            dots[d].set_data([traj[f, d, 0]], [traj[f, d, 1]])
+            bodies[d].center = traj[f, d]
             trails[d].set_data(traj[: f + 1, d, 0], traj[: f + 1, d, 1])
+        phase = "approaching target" if fr["found"] else "searching"
         end = f == len(traj) - 1
-        heading.set_text(f"{title} | step {f}" + (f" | {row['outcome'].upper()}" if end else ""))
-        return dots + trails
+        heading.set_text(f"{title} | step {f} | {phase}" + (f" | {ep['outcome'].upper()}" if end else ""))
+        return []
 
+    fig.subplots_adjust(bottom=0.1)
     anim = FuncAnimation(fig, update, frames=len(frames), blit=False)
-    anim.save(str(path), writer=PillowWriter(fps=fps), dpi=70)
+    anim.save(str(path), writer=PillowWriter(fps=fps), dpi=90)
     plt.close(fig)
 
 

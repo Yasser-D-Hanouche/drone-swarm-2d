@@ -10,6 +10,8 @@ Commit history: this workspace has no `.git` folder, so per-commit hashes are no
 - [2026-11-05: Stage 3 review, fixes, and documentation restructure](#2026-11-05-stage-3-review-fixes-and-documentation-restructure)
 - [2026-11-14: GPU environment](#2026-11-14-gpu-environment)
 - [2026-11-14 (evening): Stage 3 diagnosis and fix](#2026-11-14-evening-stage-3-diagnosis-and-fix)
+- [2026-11-14 (night): Stage 4, obstacles](#2026-11-14-night-stage-4-obstacles)
+- [2026-11-15: Stage 4 visuals and third seed](#2026-11-15-stage-4-visuals-and-third-seed)
 
 ---
 
@@ -677,3 +679,162 @@ Not established:
 3. **Ablations on the final configuration**, if the contribution of each change is needed: `env.skip_targetless_cells=false`; `reward.search_formation_weight=0` with `env.search_cohesion_radius=2.0`; `reward.search_waypoint_weight=0`. Three 2M-step jobs.
 4. **Before Stage 4.** The waypoint ignores obstacles. A cell whose centre lies deep inside an obstacle cannot be searched, because no drone can come within 0.79 m of it, so the waypoint would stay there for the rest of the episode. Such cells cannot contain the target either (`obstacle_safe_margin`) and should start as searched.
 5. **Tooling.** Make `make_run_dir` safe for same-name jobs that start in the same second. The periodic evaluation uses 10 fixed episodes and is noisy; windows of `training_episodes.csv` are a steadier measure.
+
+---
+
+## 2026-11-14 (night): Stage 4, obstacles
+
+Working branch: `martin-branch`. Code state before this entry: commit 688299a.
+
+Conventions as in the previous entry: CPU batch jobs with `cluster/train_cpu.slurm`, `--no-gif`, 100 deterministic evaluation episodes from seed `seed + 1000`, 95% Wilson intervals. Outcome counts are obstacle / boundary / drone collision out of 100 episodes; no Stage 4 episode timed out.
+
+Working principle discussed for this and later stages: Stage 5 is the deliverable. A change is judged on Stage 4 and 5 evidence and, if kept, applies to every stage. Earlier stages are re-run as cheap checks, not as constraints. Results of earlier stages stay reproducible through their commit and `config.json`.
+
+### 2026-11-14.20 Summary
+
+- Stage 4 went from about 50% (Greedy and the Stage 3 model, before any change) to **90% and 84%** on two training seeds at 2M steps. That is above the 80% level; the gate needs a third seed.
+- Cause: the search waypoint pulled the swarm into the obstacles. Around each obstacle about 7 cells cannot contain the target, but they were still waypoints. Fix: they start as searched, as the border cells do since 2026-11-14.10.
+- Tested and rejected as default: rays that ignore other drones (2026-11-14.22).
+- Batch jobs now use 17 cores (2026-11-14.23).
+
+### 2026-11-14.21 Diagnosis before any change
+
+No training. Stage 4 preset on the code of commit 688299a, episode seeds from 1042.
+
+| Policy | Stage 3 | Stage 4 (1 to 2 obstacles) | Stage 5 (3 to 5 obstacles) |
+|---|---|---|---|
+| Greedy (obstacle-blind, scripted) | 100% | 51% (300 episodes): 148 obstacle crashes, all during search | 19% (150 episodes) |
+| Best Stage 3 model (`20261114_215003_s3_final_2M`), no retraining | 95% (100 episodes) | 48% (300): 149 obstacle crashes, 8 drone collisions | 22% (150) |
+
+Findings:
+
+1. **Cells that cannot hold the target.** `_generate_obstacles` keeps the target at least r + `success_radius` + `obstacle_safe_margin` = r + 1.4 m from each obstacle centre. On average 7.5 of the 64 searchable cells per Stage 4 episode (maximum 17) cannot contain the target; in Stage 5, 17.9 (maximum 32). They were still waypoints, and the nearest unsearched cell often lay inside or beside an obstacle.
+2. **Cells nobody can reach** (no drone position within 0.79 m of the centre without a collision), the case named in 2026-11-14.19 item 4: only 0.06 per Stage 4 episode. The larger set of finding 1 is what matters.
+3. **Rays mostly see teammates.** In formation flight, 86% to 88% of ray hits in Stage 4 were other drones (Stage 3: nearly 100%). The obstacle signal in the rays is small.
+4. **Straight line to the waypoint.** The line from the centroid to the waypoint passes within 0.65 m of an obstacle's edge in about 11% of Stage 4 search steps and 21% to 24% of Stage 5 search steps.
+5. Marking the cells of finding 1 as searched (sampled test, Greedy): Stage 4 from 51% to 93%, Stage 5 from 19% to 77%.
+
+### 2026-11-14.22 Changes and round 1
+
+Changes:
+
+| File | Location | Change | Reason |
+|---|---|---|---|
+| `config.py` | `EnvConfig` | New `skip_obstacle_cells: bool = True` | Finding 1 |
+| `config.py` | `EnvConfig` | New `rays_see_drones: bool = True`; `false` makes the rays ignore other drones | Finding 3, tested below |
+| `config.py` | `STAGES` | `4_search_few_obstacles` budget 1M to 2M | Stage 3 needed 2M |
+| `environment.py` | new `_obstacle_cells` | Cells whose part inside the target sampling square lies entirely within r + 1.4 m of one obstacle centre. Exact: the region is a rectangle and the zone a disk, so the test is "all four corners inside". A cell covered only jointly by two obstacles stays searchable | Finding 1 |
+| `environment.py` | `reset` | `self.searchable_now = self.searchable & ~self._obstacle_cells()`; `self.searched` starts as its complement | Finding 1 |
+| `environment.py` | `step` | `info["searched_fraction"]` over `searchable_now` (1.0 if it is empty) | Follows |
+| `environment.py` | `_raycast` | Drone hits only when `rays_see_drones` | Finding 3 |
+| `diagnostics.py` | `summarize` | New `crash_phase_counts`: obstacle, boundary and drone crashes split into search and approach | Earlier rounds did this split by hand |
+| `diagnostics.py` | `write_report` | New table "Crashes by phase" | Same |
+
+Checks before training:
+
+- Stages 1, 2 and 3: observations, rewards and `searched_fraction` identical to commit 688299a, step for step, over 20 episodes each with random actions (1,752, 2,106 and 2,194 arrays). Stage 4 with `env.skip_obstacle_cells=false` is identical as well.
+- Greedy with the exact mask: Stage 4 92% (300 episodes; 23 obstacle crashes, all during search), Stage 5 78% (150). Mean 7.4 cells masked per Stage 4 episode (maximum 16), 17.1 in Stage 5 (maximum 29).
+- In these 450 episodes the target never lay in a masked cell, and no step had the map fully searched with the target not found.
+- 2,000-step smoke run `20261114_231457_smoke_s4`: pipeline and report table work.
+
+Results (jobs 62697138 to 62697141; 2M steps; 17 cores, 16 × 128):
+
+| Run folder | Seed | Setting | Success [95% CI] | Found | Conversion | Outcomes | Greedy |
+|---|---|---|---|---|---|---|---|
+| `20261114_231859_s4_mask` | 42 | defaults | 90% [83–94] | 90% | 100% | 9 / 0 / 1 | 92% |
+| `20261114_232009_s4_mask` | 43 | defaults | 84% [76–90] | 86% | 98% | 10 / 2 / 4 | 93% |
+| `20261114_231859_s4_mask_noray` | 42 | `env.rays_see_drones=false` | 86% [78–91] | 93% | 92% | 4 / 0 / 10 | 92% |
+| `20261114_232006_s4_mask_noray` | 43 | `env.rays_see_drones=false` | 61% [51–70] | 72% | 85% | 7 / 1 / 31 | 93% |
+
+Training success per tenth of the run:
+
+| Run | Tenths 1 to 10 |
+|---|---|
+| `s4_mask`, seed 42 | 7, 53, 72, 81, 78, 75, 77, 83, 85, 85 |
+| `s4_mask`, seed 43 | 4, 42, 64, 81, 80, 78, 80, 81, 84, 83 |
+| `s4_mask_noray`, seed 42 | 1, 22, 43, 42, 45, 59, 61, 66, 66, 70 |
+| `s4_mask_noray`, seed 43 | 1, 6, 23, 39, 47, 50, 56, 54, 57, 65 |
+
+Findings:
+
+- With the mask, PPO reaches Greedy's level (90% and 84% against 92% and 93%). All PPO obstacle crashes happened during search; conversion after detection is 98% to 100%.
+- The remaining failures match Greedy's: the frame points straight at the waypoint, also through an obstacle, and in about 10% of episodes the swarm clips it.
+- Drone-free rays: obstacle crashes fell (4 and 7 against 9 and 10), but drone collisions rose (10 and 31 against 1 and 4; 11 of the 31 in the approach), and learning was slower on both seeds. The rays are the policy's close-range sensor for its neighbours, and the relative positions of the other drones do not replace them. The default stays `true`.
+- Both default runs were still improving slowly at the end (85% and 83% training success in the last tenth).
+
+### 2026-11-14.23 Batch resources
+
+Benchmark: Stage 4, 200k steps, seed 42, periodic evaluation off (jobs 62697082 to 62697084). Throughput from `sb3_log/progress.csv`.
+
+| Cores | `n_envs` × `n_steps` | Environment steps/s | Speed-up | 2M steps of training | Core-minutes for 2M steps |
+|---|---|---|---|---|---|
+| 9 | 8 × 256 | 1,287 | 1.00 | about 26 min | about 234 |
+| 17 | 16 × 128 | 1,606 | 1.25 | about 21 min | about 357 |
+| 33 | 32 × 64 | 1,911 | 1.48 | about 17.5 min | about 577 |
+
+- Fitting update time = U + R / `n_envs` gives U ≈ 1.0 s (the PPO gradient update, one process) and R ≈ 5 s (environment stepping for 2,048 steps on one core). The update is the floor, so more cores give diminishing returns.
+- Chosen: `sbatch --cpus-per-task=17`. 33 cores was rejected: 2.5 times the credits for 1.5 times the speed, and 64-step rollout segments are untested here. `cluster/train_cpu.slurm` still defaults to 9 cores.
+- Stage 4 steps more slowly than Stage 3 (1,287 against about 1,560 environment steps/s on 9 cores), partly from the obstacle raycasts. The Stage 3 figure was measured with 8 × 128.
+- The four 2M-step jobs took 19.5 to 28.4 minutes in total, evaluation included.
+
+### 2026-11-14.24 Cost
+
+From `sam-list-usagerecords`: benchmarks 349 credits (66, 103, 180); training 3,873 credits (970, 844, 1,219, 840). Total 4,222 credits, 7 jobs.
+
+### 2026-11-14.25 Next steps
+
+1. **Update the GIF.** The Stage 4 runs used `--no-gif`, so there is no animation of the obstacle behaviour yet. Update the GIF output (`save_gif` in `diagnostics.py`) and produce GIFs for the Stage 4 models, so the remaining obstacle crashes during search can be inspected.
+2. **Third Stage 4 seed** (`--name s4_mask --seed 44`, 17 cores, about 1,000 credits) to complete the gate.
+3. **Stage 5** (3 to 5 obstacles, 3M steps). The waypoint frame through obstacles matters more there (21% to 24% of search steps). If obstacle crashes during search dominate, test a waypoint frame that routes around inflated obstacles. That plans the avoidance for the policy, a design decision to make together.
+4. **Rays that report what they hit** (a separate channel for drones and for obstacles and walls) would keep the neighbour sensing and give a clean obstacle signal. It changes the observation size. Candidate for Stage 5.
+5. Open items from 2026-11-14.19 remain: Stage 2 collision-penalty scope, approach collisions, ablations, `make_run_dir`.
+
+---
+
+## 2026-11-15: Stage 4 visuals and third seed
+
+Working branch: `martin-branch`. Code state before this entry: commit 0dbcaa8, which contains the code of 2026-11-14.22.
+
+### 2026-11-15.1 Trajectory plot and GIFs show the obstacles
+
+Problem: with random obstacles, `trajectories.png` drew no obstacles at all (it passed an empty list when `random_obstacles` was on) and overlaid 12 episodes, each with a different layout. The GIFs drew each episode's obstacles, but drones were fixed-size dots, and the rays, searched map, waypoint and detection were not visible.
+
+| File | Location | Change |
+|---|---|---|
+| `diagnostics.py` | imports | `LineCollection`, `Circle`, `Rectangle` |
+| `diagnostics.py` | new `_plot_trajectories_per_episode` | One panel per episode: rows = policies, columns = the first 4 evaluation episodes (same seeds for every policy, so one layout per column). Each panel draws that episode's obstacles and target, one colour per drone, start dots, the collision point, and the outcome in the title |
+| `diagnostics.py` | `plot_trajectories` | Uses the per-episode panels when `env.random_obstacles` is on and `env.max_obstacles > 0`; otherwise the old overlay |
+| `diagnostics.py` | new `record_episode` | Replays an evaluated episode from its seed and records per step: positions, the ray segments and whether each ray hits something, the searched map, the waypoint, and the found flag |
+| `diagnostics.py` | `save_gif` | Rewritten on top of `record_episode`; takes the policy as a new argument. Draws drones at true size (`drone_radius`), rays (red = hit within `vision_range`, grey = clear), the searched map (grey = no search needed from the start, blue = searched), the waypoint (orange square), the target (faint until found), and a title with step, phase and outcome. Warns if the replay differs from the evaluated episode. 90 dpi instead of 70 |
+| `run_experiment.py` | GIF calls | Pass the PPO policy to `save_gif` |
+
+- Ray ends mark where the drone centre would touch the obstacle, wall or drone, so they stop `drone_radius` (0.15 m) short of the surface.
+- Checked on the model of `20261114_231859_s4_mask` before the job: the replay matched the evaluated episodes; one GIF took about 12 s to render.
+- In the job below: two GIFs of 1.0 and 0.8 MB, no replay warning.
+
+### 2026-11-15.2 Third Stage 4 seed
+
+Job 62704103, 17 cores (16 × 128), GIFs on, default rays (other drones included). 27 min 17 s in total, 1,173 credits.
+
+| Run folder | Seed | Success [95% CI] | Found | Conversion | Outcomes (obstacle / boundary / drone) | Greedy |
+|---|---|---|---|---|---|---|
+| `20261115_113213_s4_mask` | 44 | 93% [86–97] | 93% | 100% | 6 / 0 / 1, all during search | 93% |
+
+Training success per tenth: 2, 32, 61, 71, 84, 85, 84, 89, 89, 91.
+
+Stage 4 over three seeds: 90%, 84% and 93% (mean 89%). **Stage 4 passes the gate.**
+
+What the GIFs and the trajectory panels show:
+
+- `episode_first.gif` (seed 1044, success): the swarm searches the upper left, passes the obstacle, detects the target and converges on it in formation.
+- `episode_failure.gif` (seed 1072, drone collision during search): the swarm loops in a tight area between the wall strip and the cells around the two obstacles, and two drones collide.
+- Most red rays during formation flight point at teammates, as measured in 2026-11-14.21.
+- `trajectories.png`: in seed 1047, PPO weaves between two obstacles to the target.
+- The model of seed 42, rendered before the job, showed the failure named in 2026-11-14.22: in seed 1042 the waypoint lies behind an obstacle, the swarm flies the straight line toward it, and one drone clips the obstacle.
+
+### 2026-11-15.3 Next steps
+
+1. **Stage 5** (3 to 5 obstacles, 3M steps), three seeds. Watch the obstacle crashes during search in the report and the failure GIFs. If they dominate, test a waypoint frame that routes around inflated obstacles (a design decision to make together).
+2. **Rays that report what they hit**: untested idea; candidate for Stage 5.
+3. **Shorter runs** (`PPO_inner_workings.md` section 6): larger minibatches (`ppo.batch_size` 768) validated on 2 to 3 seeds, plus less periodic evaluation; or a warm start from the previous stage.
+4. Open items from 2026-11-14.19 remain.

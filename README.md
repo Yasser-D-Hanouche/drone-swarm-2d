@@ -102,7 +102,7 @@ An optional coupling blends each drone's action toward the swarm mean: $a_i' = \
 
 Each drone has 7 rays spanning 120°, reaching 2.0 m, pointing along its velocity direction. A ray reports the nearest obstacle, wall, or drone, without identifying which.
 
-`env.rays_see_drones=false` makes the rays ignore other drones. In formation flight about 86% of ray hits are teammates, so the switch was tested in Stage 4. It lowered success and raised drone collisions: the rays are also the policy's close-range sensor for its neighbours. The default stays `true` (LOG 2026-11-14.22).
+`env.rays_see_drones=false` makes the rays ignore other drones. In formation flight about 86% of ray hits are teammates, so the switch was tested in Stage 4. Obstacle crashes fell (4 and 7 against 9 and 10 per 100 episodes), but drone collisions rose (10 and 31 against 1 and 4) and success fell (86% and 61% against 90% and 84%): the rays are also the policy's close-range sensor for its neighbours. The default stays `true` (LOG 2026-11-14.22).
 
 Each drone receives one observation row. For three drones the row has 126 values; in general $15 + 2(n-1) + \text{rays} + 100$.
 
@@ -187,14 +187,14 @@ Stages 3 to 5 also set `ppo.lr_schedule=linear`.
 
 Move to the next stage only after reliable performance across several training seeds. The proposed gate is about 80% success across at least three seeds.
 
-Status on 2026-11-14 (details in [LOG.md](LOG.md), entries 2026-11-14.8 to 2026-11-14.25):
+Status on 2026-11-15 (details in [LOG.md](LOG.md), entries 2026-11-14.8 to 2026-11-15.3):
 
 | Stage | Status |
 |---|---|
 | `1_known_fixed` | 100% on one seed (2026-11-05); not re-run since |
 | `2_known_random` | 100% on two seeds on 2026-11-05. On the current code two of three seeds fail (37% to 98%). Open issue, LOG 2026-11-14.15. |
 | `3_search` | 94%, 93% and 95% on three seeds at 2M steps. Passes the gate. |
-| `4_search_few_obstacles` | 90% and 84% on two seeds at 2M steps (Greedy 92% and 93%). Above the 80% level; a third seed is needed for the gate. |
+| `4_search_few_obstacles` | 90%, 84% and 93% on three seeds at 2M steps (Greedy 92% to 93%). Passes the gate. |
 | `5_full` | Not run with the current settings |
 
 ## 8. Running
@@ -228,8 +228,8 @@ Each run creates `runs/<timestamp>_<name>/`:
 | `training_episodes.csv` | One row per training episode, with `r_*` reward terms |
 | `eval_curve.csv` | Periodic evaluation during training |
 | `episode_metrics_ppo.csv`, `episode_metrics_baselines.csv` | Per-episode evaluation metrics |
-| `trajectories.png`, `reward_breakdown.png`, `training_curves.png` | Plots |
-| `episode_first.gif`, `episode_failure.gif` | Animations, unless `--no-gif` |
+| `trajectories.png`, `reward_breakdown.png`, `training_curves.png` | Plots. With random obstacles, `trajectories.png` has one panel per episode (rows = policies, columns = the first 4 evaluation episodes, the same layout per column), each with that episode's own obstacles and target. Without them, it overlays 12 episodes per policy. |
+| `episode_first.gif`, `episode_failure.gif` | Animations of the first PPO evaluation episode and the first failed one, unless `--no-gif`. The episode is replayed from its seed and shows drones at true size, their rays (red = hit within range), the searched map (grey = no search needed, blue = searched), the waypoint (orange square) and the target (faint until found). About 1 MB each. |
 | `sb3_log/` | SB3 logs |
 
 Evaluation uses the same episode seeds for Random, Greedy, and PPO, so the results are comparable.
@@ -389,7 +389,8 @@ As a batch job on a wICE A100 instead: `sbatch cluster/train_gpu.slurm --stage 3
 - Stage 3 results rest on three seeds at 2M steps and five at 1M; other stages on one to three. Use several seeds before drawing conclusions.
 - Stage 2 does not reproduce its earlier 100% on the current code: two of three seeds end with the swarm hovering just outside the success radius (LOG 2026-11-14.15).
 - About 5% of Stage 3 episodes end in a drone collision, most of them during the final approach to the target.
-- Stage 4 rests on two seeds. Stage 5 has not been run with the current settings.
+- Stage 4 rests on three seeds. Stage 5 has not been run with the current settings.
+- Rays do not report what they hit. Keeping other drones in the rays is supported by experiment (section 4.6); labelling each hit as drone or obstacle/wall is an untested idea for Stage 5.
 - The search frame points straight at the waypoint, also through obstacles. The remaining Stage 4 failures (about 10%) are mostly obstacle crashes during search, as for the obstacle-blind Greedy (LOG 2026-11-14.22).
 - Models trained before 2026-11-14 keep the same observation size (126) but were trained with a different frame and map, so they cannot be evaluated in the current environment.
 - No periodic checkpoints or resume after interruption.
